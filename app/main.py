@@ -4,13 +4,17 @@ import asyncio
 import contextlib
 import io
 import os
+import secrets
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Literal
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw
 import torch
@@ -50,6 +54,19 @@ class JobResponse(BaseModel):
 class QueueItem:
     job_id: str
     request: GenerateRequest
+
+
+def _parse_csv_env(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or ["*"]
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ImageGenerator:
@@ -126,12 +143,27 @@ class ServiceState:
         self.max_width = int(os.getenv("MAX_WIDTH", "768"))
         self.max_height = int(os.getenv("MAX_HEIGHT", "768"))
         self.max_jobs = int(os.getenv("MAX_JOBS", "256"))
+        self.output_dir = Path(os.getenv("OUTPUT_DIR", "/tmp/colab-imagegen/outputs")).expanduser()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        token = os.getenv("API_BEARER_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("API_BEARER_TOKEN is required")
+        self.api_bearer_token = token
 
         self.generator = ImageGenerator()
         self.queue: asyncio.Queue[QueueItem] = asyncio.Queue(maxsize=self.max_queue_size)
         self.jobs: dict[str, JobResponse] = {}
-        self.images: dict[str, bytes] = {}
+        self.image_paths: dict[str, Path] = {}
         self.worker: asyncio.Task[None] | None = None
+
+    def require_auth(self, authorization: str | None) -> None:
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+
+        incoming = authorization.removeprefix("Bearer ").strip()
+        if not incoming or not secrets.compare_digest(incoming, self.api_bearer_token):
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     async def start(self) -> None:
         await asyncio.to_thread(self.generator.load)
@@ -182,10 +214,10 @@ class ServiceState:
         if job.status != "succeeded":
             raise HTTPException(status_code=409, detail="Job is not complete")
 
-        image = self.images.get(job_id)
-        if image is None:
+        path = self.image_paths.get(job_id)
+        if path is None or not path.exists():
             raise HTTPException(status_code=404, detail="Image payload is unavailable")
-        return image
+        return path.read_bytes()
 
     def health(self) -> dict[str, object]:
         return {
@@ -197,6 +229,7 @@ class ServiceState:
             "max_width": self.max_width,
             "max_height": self.max_height,
             "max_steps": self.max_steps,
+            "output_dir": str(self.output_dir),
         }
 
     def _validate_request(self, req: GenerateRequest) -> None:
@@ -210,21 +243,24 @@ class ServiceState:
         if req.num_inference_steps > self.max_steps:
             raise HTTPException(status_code=400, detail=f"num_inference_steps must be <= {self.max_steps}")
 
+    def _write_image(self, job_id: str, image_bytes: bytes) -> Path:
+        path = self.output_dir / f"{job_id}.png"
+        path.write_bytes(image_bytes)
+        return path
+
     def _evict_old_jobs(self) -> None:
         if len(self.jobs) <= self.max_jobs:
             return
 
-        removable = [
-            job
-            for job in self.jobs.values()
-            if job.status in {"succeeded", "failed"}
-        ]
+        removable = [job for job in self.jobs.values() if job.status in {"succeeded", "failed"}]
         removable.sort(key=lambda item: item.completed_at or item.created_at)
 
         while len(self.jobs) > self.max_jobs and removable:
             victim = removable.pop(0)
             self.jobs.pop(victim.job_id, None)
-            self.images.pop(victim.job_id, None)
+            path = self.image_paths.pop(victim.job_id, None)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     async def _worker_loop(self) -> None:
         while True:
@@ -238,8 +274,9 @@ class ServiceState:
             job.started_at = time.time()
 
             try:
-                image = await asyncio.to_thread(self.generator.generate, item.request)
-                self.images[item.job_id] = image
+                image_bytes = await asyncio.to_thread(self.generator.generate, item.request)
+                path = await asyncio.to_thread(self._write_image, item.job_id, image_bytes)
+                self.image_paths[item.job_id] = path
                 job.status = "succeeded"
                 job.completed_at = time.time()
                 job.error = None
@@ -252,6 +289,8 @@ class ServiceState:
 
 
 state = ServiceState()
+BASE_DIR = Path(__file__).resolve().parent
+INDEX_FILE = BASE_DIR / "static" / "index.html"
 
 
 @asynccontextmanager
@@ -263,7 +302,25 @@ async def lifespan(_: FastAPI):
         await state.stop()
 
 
-app = FastAPI(title="colab-imagegen", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="colab-imagegen", version="0.2.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_parse_csv_env("CORS_ALLOW_ORIGINS", "*"),
+    allow_credentials=_parse_bool_env("CORS_ALLOW_CREDENTIALS", False),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def require_auth(authorization: str | None = Header(default=None)) -> None:
+    state.require_auth(authorization)
+
+
+@app.get("/")
+def index() -> Response:
+    if INDEX_FILE.exists():
+        return FileResponse(INDEX_FILE)
+    return JSONResponse({"message": "Frontend file not found"}, status_code=404)
 
 
 @app.get("/healthz")
@@ -272,16 +329,16 @@ def healthz() -> dict[str, object]:
 
 
 @app.post("/generate", response_model=GenerateAccepted, status_code=202)
-async def generate(req: GenerateRequest) -> GenerateAccepted:
+async def generate(req: GenerateRequest, _: None = Depends(require_auth)) -> GenerateAccepted:
     return await state.submit(req)
 
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str) -> JobResponse:
+def get_job(job_id: str, _: None = Depends(require_auth)) -> JobResponse:
     return state.get_job(job_id)
 
 
 @app.get("/jobs/{job_id}/image")
-def get_image(job_id: str) -> Response:
+def get_image(job_id: str, _: None = Depends(require_auth)) -> Response:
     image = state.get_image(job_id)
     return Response(content=image, media_type="image/png")

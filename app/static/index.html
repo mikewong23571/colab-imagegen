@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Colab Image Gen</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7fb;
+        --card: #ffffff;
+        --text: #1a1f2b;
+        --muted: #5b657a;
+        --accent: #1768ff;
+        --border: #dde3ef;
+      }
+      body {
+        margin: 0;
+        font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+        background: radial-gradient(circle at top left, #e8f1ff, var(--bg));
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px;
+        margin-bottom: 14px;
+        box-shadow: 0 8px 20px rgba(32, 52, 89, 0.08);
+      }
+      h1 { margin: 0 0 12px; font-size: 24px; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+      input, textarea, button {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        padding: 10px 12px;
+        font-size: 14px;
+      }
+      textarea { min-height: 90px; resize: vertical; }
+      button {
+        border: none;
+        background: linear-gradient(135deg, #2f7bff, var(--accent));
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .muted { color: var(--muted); font-size: 13px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      img { max-width: 100%; border-radius: 12px; border: 1px solid var(--border); }
+      pre { white-space: pre-wrap; word-break: break-word; background: #f3f6fc; padding: 10px; border-radius: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Colab Image Gen</h1>
+        <p class="muted">本页可本地或远程使用。远程调用时请填 API Base 和 Bearer Token。</p>
+        <div class="grid">
+          <div>
+            <label>API Base</label>
+            <input id="apiBase" placeholder="https://xxxx.trycloudflare.com" />
+          </div>
+          <div>
+            <label>Bearer Token</label>
+            <input id="token" placeholder="your token" type="password" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div>
+          <label>Prompt</label>
+          <textarea id="prompt">a cinematic mountain landscape, golden hour</textarea>
+        </div>
+        <div>
+          <label>Negative Prompt</label>
+          <input id="negative" placeholder="optional" />
+        </div>
+        <div class="grid" style="margin-top: 12px;">
+          <div><label>Width</label><input id="width" type="number" value="512" /></div>
+          <div><label>Height</label><input id="height" type="number" value="512" /></div>
+          <div><label>Steps</label><input id="steps" type="number" value="20" /></div>
+          <div><label>Guidance</label><input id="guidance" type="number" step="0.1" value="7.0" /></div>
+        </div>
+        <div style="margin-top: 12px;">
+          <button id="generateBtn">Generate</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <strong>状态:</strong>
+          <span id="status">idle</span>
+        </div>
+        <p class="muted" id="jobId"></p>
+        <pre id="statusJson">{}</pre>
+      </div>
+
+      <div class="card">
+        <strong>结果</strong>
+        <div style="margin-top: 10px;"><img id="preview" alt="generated image" /></div>
+      </div>
+    </div>
+
+    <script>
+      const apiBaseEl = document.getElementById("apiBase");
+      const tokenEl = document.getElementById("token");
+      const promptEl = document.getElementById("prompt");
+      const negativeEl = document.getElementById("negative");
+      const widthEl = document.getElementById("width");
+      const heightEl = document.getElementById("height");
+      const stepsEl = document.getElementById("steps");
+      const guidanceEl = document.getElementById("guidance");
+      const statusEl = document.getElementById("status");
+      const statusJsonEl = document.getElementById("statusJson");
+      const jobIdEl = document.getElementById("jobId");
+      const previewEl = document.getElementById("preview");
+      const btn = document.getElementById("generateBtn");
+
+      apiBaseEl.value = localStorage.getItem("imggen_api_base") || window.location.origin;
+      tokenEl.value = localStorage.getItem("imggen_token") || "";
+
+      function headers() {
+        const token = tokenEl.value.trim();
+        if (!token) {
+          throw new Error("Bearer token 不能为空");
+        }
+        return {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        };
+      }
+
+      async function pollJob(base, id) {
+        for (let i = 0; i < 240; i++) {
+          const res = await fetch(`${base}/jobs/${id}`, { headers: { "Authorization": headers().Authorization } });
+          const data = await res.json();
+          statusJsonEl.textContent = JSON.stringify(data, null, 2);
+          statusEl.textContent = data.status;
+          if (data.status === "succeeded") {
+            return data;
+          }
+          if (data.status === "failed") {
+            throw new Error(data.error || "任务失败");
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        throw new Error("任务超时");
+      }
+
+      async function fetchImage(base, id) {
+        const res = await fetch(`${base}/jobs/${id}/image`, { headers: { "Authorization": headers().Authorization } });
+        if (!res.ok) {
+          throw new Error(`下载图片失败: ${res.status}`);
+        }
+        const blob = await res.blob();
+        return URL.createObjectURL(blob);
+      }
+
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        previewEl.src = "";
+        statusEl.textContent = "submitting";
+        try {
+          const base = apiBaseEl.value.trim().replace(/\/$/, "");
+          if (!base) {
+            throw new Error("API Base 不能为空");
+          }
+
+          localStorage.setItem("imggen_api_base", base);
+          localStorage.setItem("imggen_token", tokenEl.value.trim());
+
+          const payload = {
+            prompt: promptEl.value,
+            negative_prompt: negativeEl.value || null,
+            width: Number(widthEl.value),
+            height: Number(heightEl.value),
+            num_inference_steps: Number(stepsEl.value),
+            guidance_scale: Number(guidanceEl.value),
+          };
+
+          const resp = await fetch(`${base}/generate`, {
+            method: "POST",
+            headers: headers(),
+            body: JSON.stringify(payload),
+          });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`提交失败: ${resp.status} ${txt}`);
+          }
+
+          const accepted = await resp.json();
+          jobIdEl.textContent = `job_id: ${accepted.job_id}`;
+          statusJsonEl.textContent = JSON.stringify(accepted, null, 2);
+
+          await pollJob(base, accepted.job_id);
+          const imageUrl = await fetchImage(base, accepted.job_id);
+          previewEl.src = imageUrl;
+        } catch (err) {
+          statusEl.textContent = "error";
+          statusJsonEl.textContent = String(err);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

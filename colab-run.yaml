@@ -13,6 +13,10 @@ runtime:
     HF_HOME: /content/.cache/huggingface
     PORT: "8000"
     MODEL_ID: runwayml/stable-diffusion-v1-5
+    API_BEARER_TOKEN: "replace-with-a-long-random-token"
+    OUTPUT_DIR: /content/.cache/colab-imagegen/outputs
+    CORS_ALLOW_ORIGINS: "*"
+    CORS_ALLOW_CREDENTIALS: "false"
     MAX_QUEUE_SIZE: "16"
     MAX_STEPS: "30"
     MAX_WIDTH: "768"

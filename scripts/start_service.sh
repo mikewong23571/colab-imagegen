@@ -8,6 +8,11 @@ PORT="${PORT:-8000}"
 STATE_DIR="${STATE_DIR:-/tmp/colab-imagegen}"
 mkdir -p "$STATE_DIR"
 
+if [ -z "${API_BEARER_TOKEN:-}" ]; then
+  echo "[start] API_BEARER_TOKEN is required" >&2
+  exit 1
+fi
+
 API_LOG="$STATE_DIR/api.log"
 TUNNEL_LOG="$STATE_DIR/cloudflared.log"
 STATE_FILE="$STATE_DIR/service.env"
