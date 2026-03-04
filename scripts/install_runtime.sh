@@ -37,6 +37,10 @@ if is_true "$OMNIPARSER_ENABLED"; then
   git -C "${OMNIPARSER_DIR}" fetch --all --tags
   git -C "${OMNIPARSER_DIR}" checkout "${OMNIPARSER_REPO_REF}"
   python -m pip install -r "${OMNIPARSER_DIR}/requirements.txt"
+  # OmniParser currently expects PaddleOCR v2-style API (e.g. `show_log` arg).
+  python -m pip install "paddleocr<3"
+  # Florence-2 remote code in OmniParser is incompatible with newer transformers.
+  python -m pip install "transformers==4.53.3"
   # paddleocr/paddlex currently imports langchain.docstore.document at runtime.
   # Newer langchain releases removed this module, so pin to a compatible major.
   python -m pip install "langchain<0.2"
