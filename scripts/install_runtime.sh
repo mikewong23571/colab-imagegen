@@ -37,6 +37,9 @@ if is_true "$OMNIPARSER_ENABLED"; then
   git -C "${OMNIPARSER_DIR}" fetch --all --tags
   git -C "${OMNIPARSER_DIR}" checkout "${OMNIPARSER_REPO_REF}"
   python -m pip install -r "${OMNIPARSER_DIR}/requirements.txt"
+  # paddleocr/paddlex currently imports langchain.docstore.document at runtime.
+  # Newer langchain releases removed this module, so pin to a compatible major.
+  python -m pip install "langchain<0.2"
 
   if is_true "$OMNIPARSER_DOWNLOAD_WEIGHTS"; then
     echo "[install][omniparser] downloading weights to ${OMNIPARSER_WEIGHTS_DIR}"
