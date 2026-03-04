@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import io
+import importlib
 import os
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -14,15 +17,30 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import Request
 from PIL import Image, ImageDraw
 import torch
 
 
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 TaskType = Literal["image_gen", "asr_whisper_small", "ui_parse_omniparser"]
+
+
+class RetryStrategy(BaseModel):
+    should_retry: bool
+    backoff_ms: int | None = None
+    max_retries: int | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    message: str
+    retry_strategy: RetryStrategy
 
 
 class GenerateRequest(BaseModel):
@@ -95,7 +113,7 @@ class JobResponse(BaseModel):
 
 
 @dataclass
-class QueueItem:
+class ImageQueueItem:
     job_id: str
     request: GenerateRequest
 
@@ -118,6 +136,21 @@ class SavedUiUpload:
     path: Path
 
 
+@dataclass
+class AsrQueueItem:
+    saved_upload: SavedAsrUpload
+    result_future: asyncio.Future[AsrTranscribeResponse]
+
+
+@dataclass
+class UiParseQueueItem:
+    saved_upload: SavedUiUpload
+    result_future: asyncio.Future[UiParseResponse]
+
+
+HeavyQueueItem = ImageQueueItem | UiParseQueueItem
+
+
 def _parse_csv_env(name: str, default: str) -> list[str]:
     raw = os.getenv(name, default)
     values = [item.strip() for item in raw.split(",") if item.strip()]
@@ -129,6 +162,34 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _parse_float_env(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be a float") from exc
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}")
+    return value
 
 
 class ImageGenerator:
@@ -294,18 +355,163 @@ class WhisperTranscriber:
 
 
 class OmniParserEngine:
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(self, *, enabled: bool, repo_dir: Path, weights_dir: Path) -> None:
         self.model_id = os.getenv("OMNIPARSER_MODEL_ID", "microsoft/OmniParser-v2.0")
         self.enabled = enabled
         self.mock_mode = _parse_bool_env("MOCK_UIPARSE", True)
+        self.repo_dir = repo_dir
+        self.weights_dir = weights_dir
+        self.caption_model_name = os.getenv("OMNIPARSER_CAPTION_MODEL_NAME", "florence2")
+        self.box_threshold = _parse_float_env("OMNIPARSER_BOX_THRESHOLD", 0.05, minimum=0.0)
+        self.default_confidence = min(
+            max(_parse_float_env("OMNIPARSER_DEFAULT_CONFIDENCE", 0.5, minimum=0.0), 0.0),
+            1.0,
+        )
+        self._native_engine: object | None = None
+        self._load_error: str | None = None
+        self._load_lock = threading.Lock()
 
-    def parse(self, image_path: Path) -> tuple[str, list[UiElement]]:
-        with Image.open(image_path) as image:
-            width, height = image.size
+    @property
+    def required_paths(self) -> list[Path]:
+        return [
+            self.repo_dir / "util" / "omniparser.py",
+            self.weights_dir / "icon_detect" / "model.pt",
+            self.weights_dir / "icon_caption_florence" / "model.safetensors",
+        ]
 
+    def missing_required_paths(self) -> list[Path]:
+        return [path for path in self.required_paths if not path.exists()]
+
+    @property
+    def ready(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.mock_mode:
+            return True
+        return len(self.missing_required_paths()) == 0
+
+    @property
+    def loaded(self) -> bool:
+        return self._native_engine is not None
+
+    @property
+    def load_error(self) -> str | None:
+        return self._load_error
+
+    @property
+    def engine_mode(self) -> str:
+        if not self.enabled:
+            return "mock" if self.mock_mode else "disabled"
+        if self.mock_mode:
+            return "mock"
+        if self._native_engine is not None:
+            return "native"
+        if self._load_error:
+            return "native_error"
+        return "native_unloaded"
+
+    def _load(self) -> None:
+        missing = self.missing_required_paths()
+        if missing:
+            missing_str = ", ".join(str(path) for path in missing)
+            raise RuntimeError(f"omniparser required files are missing: {missing_str}")
+
+        repo_dir_str = str(self.repo_dir)
+        if repo_dir_str not in sys.path:
+            sys.path.insert(0, repo_dir_str)
+
+        config = {
+            "som_model_path": str(self.weights_dir / "icon_detect" / "model.pt"),
+            "caption_model_name": self.caption_model_name,
+            "caption_model_path": str(self.weights_dir / "icon_caption_florence"),
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "BOX_TRESHOLD": self.box_threshold,
+        }
+
+        module = importlib.import_module("util.omniparser")
+        omniparser_cls = getattr(module, "Omniparser", None)
+        if omniparser_cls is None:
+            raise RuntimeError("OmniParser class `Omniparser` not found in util.omniparser")
+
+        self._native_engine = omniparser_cls(config)
+        self._load_error = None
+
+    def _ensure_loaded(self) -> None:
+        if self._native_engine is not None:
+            return
+        if self._load_error is not None:
+            raise RuntimeError(f"failed to initialize omniparser engine: {self._load_error}")
+        with self._load_lock:
+            if self._native_engine is not None:
+                return
+            if self._load_error is not None:
+                raise RuntimeError(f"failed to initialize omniparser engine: {self._load_error}")
+            try:
+                self._load()
+            except Exception as exc:
+                self._load_error = str(exc)
+                raise RuntimeError(f"failed to initialize omniparser engine: {exc}") from exc
+
+    def _normalize_bbox(self, raw_bbox: object, width: int, height: int) -> list[float] | None:
+        if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+            return None
+        try:
+            x1, y1, x2, y2 = [float(item) for item in raw_bbox]
+        except (TypeError, ValueError):
+            return None
+
+        # Upstream OmniParser usually returns [x1, y1, x2, y2] in ratio space.
+        # A few variants may return pixel space; support both.
+        if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+            x1 *= width
+            x2 *= width
+            y1 *= height
+            y2 *= height
+
+        left = max(0.0, min(float(width), min(x1, x2)))
+        right = max(0.0, min(float(width), max(x1, x2)))
+        top = max(0.0, min(float(height), min(y1, y2)))
+        bottom = max(0.0, min(float(height), max(y1, y2)))
+        if right <= left or bottom <= top:
+            return None
+        return [round(left, 2), round(top, 2), round(right, 2), round(bottom, 2)]
+
+    def _normalize_elements(self, raw_items: object, width: int, height: int) -> list[UiElement]:
+        if not isinstance(raw_items, list):
+            return []
+        elements: list[UiElement] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            bbox = self._normalize_bbox(item.get("bbox"), width, height)
+            if bbox is None:
+                continue
+            raw_element = str(item.get("type") or "unknown")
+            if item.get("interactivity") is True and raw_element == "icon":
+                raw_element = "icon_interactive"
+            raw_text = item.get("content")
+            text = str(raw_text).strip() if raw_text is not None else None
+            if text == "":
+                text = None
+            confidence_raw = item.get("confidence")
+            if isinstance(confidence_raw, (int, float)):
+                confidence = min(max(float(confidence_raw), 0.0), 1.0)
+            else:
+                confidence = self.default_confidence
+            elements.append(
+                UiElement(
+                    element=raw_element,
+                    bbox=bbox,
+                    confidence=confidence,
+                    text=text,
+                )
+            )
+        return elements
+
+    def _placeholder_elements(self, width: int, height: int) -> list[UiElement]:
         width = max(width, 1)
         height = max(height, 1)
-        elements = [
+        return [
             UiElement(
                 element="screen",
                 bbox=[0.0, 0.0, float(width), float(height)],
@@ -325,17 +531,62 @@ class OmniParserEngine:
             ),
         ]
 
+    def _parse_native(self, image_path: Path) -> list[UiElement]:
+        self._ensure_loaded()
+        if self._native_engine is None:
+            raise RuntimeError("OmniParser engine is not loaded")
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+        width = max(width, 1)
+        height = max(height, 1)
+
+        image_base64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        parse_fn = getattr(self._native_engine, "parse", None)
+        if not callable(parse_fn):
+            raise RuntimeError("OmniParser engine does not expose callable `parse`")
+        parse_output = parse_fn(image_base64)
+
+        parsed_items: object = None
+        if isinstance(parse_output, tuple):
+            if len(parse_output) >= 2:
+                parsed_items = parse_output[1]
+        elif isinstance(parse_output, list):
+            parsed_items = parse_output
+
+        elements = self._normalize_elements(parsed_items, width=width, height=height)
+        if not elements:
+            elements = self._placeholder_elements(width=width, height=height)
+        return elements
+
+    def parse(self, image_path: Path) -> tuple[str, list[UiElement]]:
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        elements = self._placeholder_elements(width=width, height=height)
+
         if self.mock_mode or not self.enabled:
             return "mock", elements
 
-        # Placeholder path after dependency/weights bootstrap in M2-1.
-        # The real OmniParser execution flow will replace this in later task.
-        return "placeholder", elements
+        native_elements = self._parse_native(image_path)
+        return "native", native_elements
 
 
 class ServiceState:
     def __init__(self) -> None:
-        self.max_queue_size = int(os.getenv("MAX_QUEUE_SIZE", "16"))
+        legacy_max_queue_size = _parse_int_env("MAX_QUEUE_SIZE", 16, minimum=1)
+        self.heavy_queue_max_size = _parse_int_env(
+            "HEAVY_QUEUE_MAX_SIZE",
+            legacy_max_queue_size,
+            minimum=1,
+        )
+        self.light_queue_max_size = _parse_int_env(
+            "LIGHT_QUEUE_MAX_SIZE",
+            max(legacy_max_queue_size, 16),
+            minimum=1,
+        )
+        self.heavy_queue_concurrency = _parse_int_env("HEAVY_QUEUE_CONCURRENCY", 1, minimum=1)
+        self.light_queue_concurrency = _parse_int_env("LIGHT_QUEUE_CONCURRENCY", 2, minimum=1)
         self.max_steps = int(os.getenv("MAX_STEPS", "30"))
         self.max_width = int(os.getenv("MAX_WIDTH", "768"))
         self.max_height = int(os.getenv("MAX_HEIGHT", "768"))
@@ -363,11 +614,21 @@ class ServiceState:
 
         self.generator = ImageGenerator()
         self.whisper = WhisperTranscriber()
-        self.omniparser_engine = OmniParserEngine(enabled=self.omniparser_enabled)
-        self.queue: asyncio.Queue[QueueItem] = asyncio.Queue(maxsize=self.max_queue_size)
+        self.omniparser_engine = OmniParserEngine(
+            enabled=self.omniparser_enabled,
+            repo_dir=self.omniparser_repo_dir,
+            weights_dir=self.omniparser_weights_dir,
+        )
+        self.heavy_queue: asyncio.Queue[HeavyQueueItem] = asyncio.Queue(maxsize=self.heavy_queue_max_size)
+        self.light_queue: asyncio.Queue[AsrQueueItem] = asyncio.Queue(maxsize=self.light_queue_max_size)
+        self.heavy_task_runtime_limit = 1
+        self.heavy_task_semaphore = asyncio.Semaphore(self.heavy_task_runtime_limit)
+        self.heavy_tasks_running = 0
+        self.heavy_tasks_max_running_seen = 0
         self.jobs: dict[str, JobResponse] = {}
         self.image_paths: dict[str, Path] = {}
-        self.worker: asyncio.Task[None] | None = None
+        self.heavy_workers: list[asyncio.Task[None]] = []
+        self.light_workers: list[asyncio.Task[None]] = []
         self.image_submitted_total = 0
         self.image_succeeded_total = 0
         self.image_failed_total = 0
@@ -378,6 +639,13 @@ class ServiceState:
         self.asr_failed_total = 0
         self.asr_duration_ms_sum = 0
         self.asr_last_duration_ms = 0
+        self.ui_parse_submitted_total = 0
+        self.ui_parse_succeeded_total = 0
+        self.ui_parse_failed_total = 0
+        self.ui_parse_duration_ms_sum = 0
+        self.ui_parse_last_duration_ms = 0
+        self.ui_parse_last_elements_count = 0
+        self.ui_parse_last_engine_mode: str | None = None
         self.gpu_breaker_triggered_total = 0
 
     def require_auth(self, authorization: str | None) -> None:
@@ -390,13 +658,24 @@ class ServiceState:
 
     async def start(self) -> None:
         await asyncio.to_thread(self.generator.load)
-        self.worker = asyncio.create_task(self._worker_loop(), name="imagegen-worker")
+        self.heavy_workers = [
+            asyncio.create_task(self._heavy_worker_loop(index + 1), name=f"heavy-worker-{index + 1}")
+            for index in range(self.heavy_queue_concurrency)
+        ]
+        self.light_workers = [
+            asyncio.create_task(self._light_worker_loop(index + 1), name=f"light-worker-{index + 1}")
+            for index in range(self.light_queue_concurrency)
+        ]
 
     async def stop(self) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
+        workers = [*self.heavy_workers, *self.light_workers]
+        self.heavy_workers = []
+        self.light_workers = []
+        for worker in workers:
+            worker.cancel()
+        for worker in workers:
             with contextlib.suppress(asyncio.CancelledError):
-                await self.worker
+                await worker
 
     async def submit(self, req: GenerateRequest) -> GenerateAccepted:
         self._validate_request(req)
@@ -414,12 +693,32 @@ class ServiceState:
         )
 
         try:
-            self.queue.put_nowait(QueueItem(job_id=job_id, request=req))
+            self.heavy_queue.put_nowait(ImageQueueItem(job_id=job_id, request=req))
         except asyncio.QueueFull:
             self.jobs.pop(job_id, None)
-            raise HTTPException(status_code=429, detail="Queue is full")
+            raise HTTPException(status_code=429, detail="heavy queue is full")
 
         return GenerateAccepted(job_id=job_id, status="queued")
+
+    def _check_ui_parse_runtime_ready(self) -> None:
+        if self.omniparser_engine.mock_mode:
+            return
+        if not self.omniparser_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="omniparser is disabled; set OMNIPARSER_ENABLED=1 or use MOCK_UIPARSE=1",
+            )
+        if self.omniparser_engine.load_error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"omniparser is not ready ({self.omniparser_engine.load_error})",
+            )
+        missing = [str(path) for path in self.omniparser_engine.missing_required_paths()]
+        if missing:
+            raise HTTPException(
+                status_code=503,
+                detail=f"omniparser required files are missing: {', '.join(missing)}",
+            )
 
     def get_job(self, job_id: str) -> JobResponse:
         job = self.jobs.get(job_id)
@@ -471,8 +770,12 @@ class ServiceState:
     def health(self) -> dict[str, object]:
         image_completed_total = self.image_succeeded_total + self.image_failed_total
         asr_completed_total = self.asr_succeeded_total + self.asr_failed_total
+        ui_parse_completed_total = self.ui_parse_succeeded_total + self.ui_parse_failed_total
         image_avg_ms = int(self.image_duration_ms_sum / image_completed_total) if image_completed_total else 0
         asr_avg_ms = int(self.asr_duration_ms_sum / asr_completed_total) if asr_completed_total else 0
+        ui_parse_avg_ms = (
+            int(self.ui_parse_duration_ms_sum / ui_parse_completed_total) if ui_parse_completed_total else 0
+        )
         gpu_memory = self._gpu_memory_metrics()
         gpu_guard_open, guard_reason = self._gpu_guard_state(gpu_memory)
         omniparser = self._omniparser_state()
@@ -481,8 +784,12 @@ class ServiceState:
             "status": "ok",
             "model_id": self.generator.model_id,
             "device": self.generator.device,
-            "queue_size": self.queue.qsize(),
-            "queue_capacity": self.max_queue_size,
+            "queue_size": self.heavy_queue.qsize(),
+            "queue_capacity": self.heavy_queue_max_size,
+            "heavy_queue_size": self.heavy_queue.qsize(),
+            "heavy_queue_capacity": self.heavy_queue_max_size,
+            "light_queue_size": self.light_queue.qsize(),
+            "light_queue_capacity": self.light_queue_max_size,
             "max_width": self.max_width,
             "max_height": self.max_height,
             "max_steps": self.max_steps,
@@ -496,8 +803,21 @@ class ServiceState:
             "omniparser": omniparser,
             "metrics": {
                 "queue": {
-                    "size": self.queue.qsize(),
-                    "capacity": self.max_queue_size,
+                    "size": self.heavy_queue.qsize(),
+                    "capacity": self.heavy_queue_max_size,
+                    "heavy": {
+                        "size": self.heavy_queue.qsize(),
+                        "capacity": self.heavy_queue_max_size,
+                        "concurrency": self.heavy_queue_concurrency,
+                        "runtime_limit": self.heavy_task_runtime_limit,
+                        "running": self.heavy_tasks_running,
+                        "max_running_seen": self.heavy_tasks_max_running_seen,
+                    },
+                    "light": {
+                        "size": self.light_queue.qsize(),
+                        "capacity": self.light_queue_max_size,
+                        "concurrency": self.light_queue_concurrency,
+                    },
                 },
                 "image_jobs": {
                     "submitted_total": self.image_submitted_total,
@@ -513,6 +833,15 @@ class ServiceState:
                     "last_duration_ms": self.asr_last_duration_ms,
                     "avg_duration_ms": asr_avg_ms,
                 },
+                "ui_parse_jobs": {
+                    "submitted_total": self.ui_parse_submitted_total,
+                    "succeeded_total": self.ui_parse_succeeded_total,
+                    "failed_total": self.ui_parse_failed_total,
+                    "last_duration_ms": self.ui_parse_last_duration_ms,
+                    "avg_duration_ms": ui_parse_avg_ms,
+                    "last_elements_count": self.ui_parse_last_elements_count,
+                    "last_engine_mode": self.ui_parse_last_engine_mode,
+                },
                 "gpu_memory": {
                     **gpu_memory,
                     "guard": {
@@ -526,32 +855,33 @@ class ServiceState:
         }
 
     def _omniparser_state(self) -> dict[str, object]:
+        missing = [str(path) for path in self.omniparser_engine.missing_required_paths()]
         if not self.omniparser_enabled:
-            return {
-                "enabled": False,
-                "ready": False,
-                "reason": "disabled",
-                "engine_mode": "mock" if self.omniparser_engine.mock_mode else "disabled",
-                "model_id": self.omniparser_engine.model_id,
-                "repo_dir": str(self.omniparser_repo_dir),
-                "weights_dir": str(self.omniparser_weights_dir),
-            }
-
-        required_paths = [
-            self.omniparser_repo_dir / "util" / "omniparser.py",
-            self.omniparser_weights_dir / "icon_detect" / "model.pt",
-            self.omniparser_weights_dir / "icon_caption_florence" / "model.safetensors",
-        ]
-        missing = [str(path) for path in required_paths if not path.exists()]
-        return {
-            "enabled": True,
-            "ready": len(missing) == 0,
-            "engine_mode": "mock" if self.omniparser_engine.mock_mode else "placeholder",
+            reason = "disabled"
+        elif self.omniparser_engine.mock_mode:
+            reason = "mock_mode"
+        elif missing:
+            reason = "missing_files"
+        elif self.omniparser_engine.load_error:
+            reason = "load_error"
+        else:
+            reason = "ok"
+        state = {
+            "enabled": self.omniparser_enabled,
+            "ready": self.omniparser_engine.ready,
+            "reason": reason,
+            "engine_mode": self.omniparser_engine.engine_mode,
             "model_id": self.omniparser_engine.model_id,
             "repo_dir": str(self.omniparser_repo_dir),
             "weights_dir": str(self.omniparser_weights_dir),
+            "caption_model_name": self.omniparser_engine.caption_model_name,
+            "box_threshold": self.omniparser_engine.box_threshold,
+            "loaded": self.omniparser_engine.loaded,
             "missing_files": missing,
         }
+        if self.omniparser_engine.load_error:
+            state["load_error"] = self.omniparser_engine.load_error
+        return state
 
     def _gpu_memory_metrics(self) -> dict[str, object]:
         if not torch.cuda.is_available():
@@ -653,46 +983,23 @@ class ServiceState:
     async def transcribe_audio(self, file: UploadFile) -> AsrTranscribeResponse:
         self.asr_submitted_total += 1
         saved = await self._save_asr_upload(file)
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[AsrTranscribeResponse] = loop.create_future()
         job = self._create_job(
             job_id=saved.upload_id,
             task_type="asr_whisper_small",
-            status="running",
+            status="queued",
             input_filename=saved.filename,
         )
-        started_at = time.time()
-        job.started_at = started_at
-        try:
-            text, language, segments = await asyncio.to_thread(self.whisper.transcribe, saved.path)
-        except Exception as exc:
-            elapsed_ms = int((time.time() - started_at) * 1000)
-            self.asr_failed_total += 1
-            self.asr_duration_ms_sum += elapsed_ms
-            self.asr_last_duration_ms = elapsed_ms
-            job.status = "failed"
-            job.completed_at = time.time()
-            job.error = str(exc)
-            raise HTTPException(status_code=500, detail=f"asr transcription failed: {exc}") from exc
 
-        elapsed_ms = int((time.time() - started_at) * 1000)
-        self.asr_succeeded_total += 1
-        self.asr_duration_ms_sum += elapsed_ms
-        self.asr_last_duration_ms = elapsed_ms
-        job.status = "succeeded"
-        job.completed_at = time.time()
-        job.error = None
-        return AsrTranscribeResponse(
-            job_id=saved.upload_id,
-            upload_id=saved.upload_id,
-            status="succeeded",
-            filename=saved.filename,
-            content_type=saved.content_type,
-            size_bytes=saved.size_bytes,
-            text=text,
-            segments=segments,
-            language=language,
-            model_id=self.whisper.model_id,
-            elapsed_ms=elapsed_ms,
-        )
+        try:
+            self.light_queue.put_nowait(AsrQueueItem(saved_upload=saved, result_future=result_future))
+        except asyncio.QueueFull:
+            self.jobs.pop(job.job_id, None)
+            saved.path.unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail="light queue is full")
+
+        return await result_future
 
     async def _save_ui_upload(self, file: UploadFile) -> SavedUiUpload:
         filename = Path((file.filename or "").strip()).name
@@ -741,39 +1048,27 @@ class ServiceState:
         )
 
     async def parse_ui_image(self, file: UploadFile) -> UiParseResponse:
+        self._check_heavy_task_guard()
+        self._check_ui_parse_runtime_ready()
+        self.ui_parse_submitted_total += 1
         saved = await self._save_ui_upload(file)
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[UiParseResponse] = loop.create_future()
         job = self._create_job(
             job_id=saved.parse_id,
             task_type="ui_parse_omniparser",
-            status="running",
+            status="queued",
             input_filename=saved.filename,
         )
-        started_at = time.time()
-        job.started_at = started_at
-        try:
-            engine_mode, elements = await asyncio.to_thread(self.omniparser_engine.parse, saved.path)
-        except Exception as exc:
-            job.status = "failed"
-            job.completed_at = time.time()
-            job.error = str(exc)
-            raise HTTPException(status_code=500, detail=f"ui parse failed: {exc}") from exc
 
-        elapsed_ms = int((time.time() - started_at) * 1000)
-        job.status = "succeeded"
-        job.completed_at = time.time()
-        job.error = None
-        return UiParseResponse(
-            job_id=saved.parse_id,
-            parse_id=saved.parse_id,
-            status="succeeded",
-            filename=saved.filename,
-            content_type=saved.content_type,
-            size_bytes=saved.size_bytes,
-            model_id=self.omniparser_engine.model_id,
-            engine_mode=engine_mode,
-            elements=elements,
-            elapsed_ms=elapsed_ms,
-        )
+        try:
+            self.heavy_queue.put_nowait(UiParseQueueItem(saved_upload=saved, result_future=result_future))
+        except asyncio.QueueFull:
+            self.jobs.pop(job.job_id, None)
+            saved.path.unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail="heavy queue is full")
+
+        return await result_future
 
     def _validate_request(self, req: GenerateRequest) -> None:
         if req.width > self.max_width or req.height > self.max_height:
@@ -791,6 +1086,26 @@ class ServiceState:
         path.write_bytes(image_bytes)
         return path
 
+    @asynccontextmanager
+    async def _reserve_heavy_task_slot(self):
+        await self.heavy_task_semaphore.acquire()
+        try:
+            yield
+        finally:
+            self.heavy_task_semaphore.release()
+
+    @asynccontextmanager
+    async def _track_heavy_task_running(self):
+        # Tracks active heavy executions for health/metrics without affecting admission.
+        # Admission is enforced separately by reserving a semaphore slot before dequeue.
+        self.heavy_tasks_running += 1
+        if self.heavy_tasks_running > self.heavy_tasks_max_running_seen:
+            self.heavy_tasks_max_running_seen = self.heavy_tasks_running
+        try:
+            yield
+        finally:
+            self.heavy_tasks_running = max(self.heavy_tasks_running - 1, 0)
+
     def _evict_old_jobs(self) -> None:
         if len(self.jobs) <= self.max_jobs:
             return
@@ -805,38 +1120,150 @@ class ServiceState:
             if path is not None:
                 path.unlink(missing_ok=True)
 
-    async def _worker_loop(self) -> None:
-        while True:
-            item = await self.queue.get()
-            job = self.jobs.get(item.job_id)
-            if job is None:
-                self.queue.task_done()
-                continue
+    async def _process_image_job(self, item: ImageQueueItem) -> None:
+        job = self.jobs.get(item.job_id)
+        if job is None:
+            return
 
-            job.status = "running"
-            job.started_at = time.time()
+        job.status = "running"
+        job.started_at = time.time()
 
-            try:
+        try:
+            async with self._track_heavy_task_running():
                 image_bytes = await asyncio.to_thread(self.generator.generate, item.request)
                 path = await asyncio.to_thread(self._write_image, item.job_id, image_bytes)
-                self.image_paths[item.job_id] = path
-                job.status = "succeeded"
-                job.completed_at = time.time()
-                job.error = None
-                elapsed_ms = int((job.completed_at - (job.started_at or job.completed_at)) * 1000)
-                self.image_succeeded_total += 1
-                self.image_duration_ms_sum += elapsed_ms
-                self.image_last_duration_ms = elapsed_ms
-            except Exception as exc:
-                job.status = "failed"
-                job.completed_at = time.time()
-                job.error = str(exc)
-                elapsed_ms = int((job.completed_at - (job.started_at or job.completed_at)) * 1000)
-                self.image_failed_total += 1
-                self.image_duration_ms_sum += elapsed_ms
-                self.image_last_duration_ms = elapsed_ms
+            self.image_paths[item.job_id] = path
+            job.status = "succeeded"
+            job.completed_at = time.time()
+            job.error = None
+            elapsed_ms = int((job.completed_at - (job.started_at or job.completed_at)) * 1000)
+            self.image_succeeded_total += 1
+            self.image_duration_ms_sum += elapsed_ms
+            self.image_last_duration_ms = elapsed_ms
+        except Exception as exc:
+            job.status = "failed"
+            job.completed_at = time.time()
+            job.error = str(exc)
+            elapsed_ms = int((job.completed_at - (job.started_at or job.completed_at)) * 1000)
+            self.image_failed_total += 1
+            self.image_duration_ms_sum += elapsed_ms
+            self.image_last_duration_ms = elapsed_ms
+
+    async def _process_asr_job(self, item: AsrQueueItem) -> None:
+        saved = item.saved_upload
+        job = self.jobs.get(saved.upload_id)
+        if job is None:
+            if not item.result_future.done():
+                item.result_future.set_exception(HTTPException(status_code=404, detail="Job not found"))
+            return
+
+        job.status = "running"
+        started_at = time.time()
+        job.started_at = started_at
+        try:
+            text, language, segments = await asyncio.to_thread(self.whisper.transcribe, saved.path)
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            self.asr_succeeded_total += 1
+            self.asr_duration_ms_sum += elapsed_ms
+            self.asr_last_duration_ms = elapsed_ms
+            job.status = "succeeded"
+            job.completed_at = time.time()
+            job.error = None
+            response = AsrTranscribeResponse(
+                job_id=saved.upload_id,
+                upload_id=saved.upload_id,
+                status="succeeded",
+                filename=saved.filename,
+                content_type=saved.content_type,
+                size_bytes=saved.size_bytes,
+                text=text,
+                segments=segments,
+                language=language,
+                model_id=self.whisper.model_id,
+                elapsed_ms=elapsed_ms,
+            )
+            if not item.result_future.done():
+                item.result_future.set_result(response)
+        except Exception as exc:
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            self.asr_failed_total += 1
+            self.asr_duration_ms_sum += elapsed_ms
+            self.asr_last_duration_ms = elapsed_ms
+            job.status = "failed"
+            job.completed_at = time.time()
+            job.error = str(exc)
+            if not item.result_future.done():
+                item.result_future.set_exception(HTTPException(status_code=500, detail=f"asr transcription failed: {exc}"))
+
+    async def _process_ui_parse_job(self, item: UiParseQueueItem) -> None:
+        saved = item.saved_upload
+        job = self.jobs.get(saved.parse_id)
+        if job is None:
+            if not item.result_future.done():
+                item.result_future.set_exception(HTTPException(status_code=404, detail="Job not found"))
+            return
+
+        job.status = "running"
+        started_at = time.time()
+        job.started_at = started_at
+        try:
+            async with self._track_heavy_task_running():
+                engine_mode, elements = await asyncio.to_thread(self.omniparser_engine.parse, saved.path)
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            self.ui_parse_succeeded_total += 1
+            self.ui_parse_duration_ms_sum += elapsed_ms
+            self.ui_parse_last_duration_ms = elapsed_ms
+            self.ui_parse_last_elements_count = len(elements)
+            self.ui_parse_last_engine_mode = engine_mode
+            job.status = "succeeded"
+            job.completed_at = time.time()
+            job.error = None
+            response = UiParseResponse(
+                job_id=saved.parse_id,
+                parse_id=saved.parse_id,
+                status="succeeded",
+                filename=saved.filename,
+                content_type=saved.content_type,
+                size_bytes=saved.size_bytes,
+                model_id=self.omniparser_engine.model_id,
+                engine_mode=engine_mode,
+                elements=elements,
+                elapsed_ms=elapsed_ms,
+            )
+            if not item.result_future.done():
+                item.result_future.set_result(response)
+        except Exception as exc:
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            self.ui_parse_failed_total += 1
+            self.ui_parse_duration_ms_sum += elapsed_ms
+            self.ui_parse_last_duration_ms = elapsed_ms
+            self.ui_parse_last_engine_mode = None
+            self.ui_parse_last_elements_count = 0
+            job.status = "failed"
+            job.completed_at = time.time()
+            job.error = str(exc)
+            if not item.result_future.done():
+                item.result_future.set_exception(HTTPException(status_code=500, detail=f"ui parse failed: {exc}"))
+
+    async def _heavy_worker_loop(self, _: int) -> None:
+        while True:
+            async with self._reserve_heavy_task_slot():
+                item = await self.heavy_queue.get()
+                try:
+                    if isinstance(item, ImageQueueItem):
+                        await self._process_image_job(item)
+                    else:
+                        await self._process_ui_parse_job(item)
+                finally:
+                    self.heavy_queue.task_done()
+
+    async def _light_worker_loop(self, _: int) -> None:
+        while True:
+            item = await self.light_queue.get()
+            try:
+                await self._process_asr_job(item)
             finally:
-                self.queue.task_done()
+                self.light_queue.task_done()
 
 
 state = ServiceState()
@@ -861,6 +1288,69 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _build_error_response(status_code: int, detail: str) -> dict[str, object]:
+    cat = "internal_error"
+    retry = False
+    backoff = None
+    max_retries = None
+
+    if status_code == 401:
+        cat = "auth_error"
+    elif status_code == 503:
+        cat = "service_unavailable"
+        retry = True
+        backoff = 5000
+        max_retries = 5
+    elif status_code == 429:
+        if "queue is full" in detail.lower():
+            cat = "queue_full"
+            retry = True
+            backoff = 2000
+            max_retries = 3
+        elif "guard is open" in detail.lower():
+            cat = "circuit_breaker"
+            retry = True
+            backoff = 5000
+            max_retries = 3
+        else:
+            cat = "rate_limit"
+            retry = True
+            backoff = 2000
+            max_retries = 3
+    elif 400 <= status_code < 500:
+        cat = "invalid_request"
+    elif status_code >= 500:
+        cat = "internal_error"
+
+    return {
+        "error": cat,
+        "message": detail,
+        "retry_strategy": {
+            "should_retry": retry,
+            "backoff_ms": backoff,
+            "max_retries": max_retries,
+        }
+    }
+
+
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_build_error_response(exc.status_code, detail),
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content=_build_error_response(422, str(exc.errors()))
+    )
 
 
 def require_auth(authorization: str | None = Header(default=None)) -> None:

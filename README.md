@@ -141,7 +141,7 @@ curl -X POST "http://127.0.0.1:8000/ui/parse" \
   -F "file=@./screen.png"
 ```
 
-返回示例（当前为 mock/placeholder 解析结果）：
+返回示例（`engine_mode` 可能为 `mock` 或 `native`）：
 
 ```json
 {
@@ -152,12 +152,26 @@ curl -X POST "http://127.0.0.1:8000/ui/parse" \
   "content_type": "image/png",
   "size_bytes": 120304,
   "model_id": "microsoft/OmniParser-v2.0",
-  "engine_mode": "mock",
+  "engine_mode": "native",
   "elements": [
-    { "element": "screen", "bbox": [0, 0, 1080, 1920], "confidence": 0.99, "text": null },
-    { "element": "center_region", "bbox": [216, 384, 864, 1536], "confidence": 0.8, "text": "placeholder" }
+    { "element": "text", "bbox": [48.1, 98.0, 340.2, 141.4], "confidence": 0.5, "text": "Settings" },
+    { "element": "icon_interactive", "bbox": [40.0, 280.0, 190.0, 430.0], "confidence": 0.5, "text": "Search icon" }
   ],
-  "elapsed_ms": 12
+  "elapsed_ms": 863
+}
+```
+
+错误响应结构示例（例如 429 队列满）：
+
+```json
+{
+  "error": "queue_full",
+  "message": "heavy queue is full",
+  "retry_strategy": {
+    "should_retry": true,
+    "backoff_ms": 2000,
+    "max_retries": 3
+  }
 }
 ```
 
@@ -176,7 +190,34 @@ export OMNIPARSER_DOWNLOAD_WEIGHTS=1
 bash scripts/install_runtime.sh
 ```
 
-初始化结果可通过 `GET /healthz` 的 `omniparser` 字段查看（`enabled/ready/missing_files`）。
+启用真实 OmniParser 推理（非 mock）：
+
+```bash
+export MOCK_UIPARSE=0
+```
+
+初始化结果可通过 `GET /healthz` 的 `omniparser` 字段查看（`enabled/ready/engine_mode/missing_files/load_error`）。
+
+当 `MOCK_UIPARSE=0` 且 OmniParser 依赖/权重未就绪时，`POST /ui/parse` 将直接返回 `503 service_unavailable`（不进入 heavy 队列），用于快速暴露环境问题。
+
+建议在 Colab runtime 用以下脚本做一次验收并留存证据：
+
+```bash
+API_BEARER_TOKEN="$API_BEARER_TOKEN" python scripts/verify_uiparse_native.py \
+  --base-url "http://127.0.0.1:${PORT:-8000}" \
+  --expect-engine-mode native
+```
+
+或使用统一入口：
+
+```bash
+bash scripts/ops.sh verify-uiparse --expect-engine-mode native
+```
+
+该脚本会输出：
+- `health.omniparser.*`（enabled/ready/engine_mode/reason）
+- `ui_parse.engine_mode/elements_count/elapsed_ms/parse_id`
+- `health.metrics.ui_parse_jobs`（提交/成功/失败/耗时/最近元素数）
 
 ### 5) 停止与回收
 
@@ -204,9 +245,12 @@ npx --yes --package="$PKG" colab-cli -- assign rm <endpoint>
 
 `GET /healthz` 现在包含 `metrics` 字段，可用于脚本采集：
 
-- `metrics.queue.size/capacity`
+- `metrics.queue.heavy.size/capacity/concurrency`
+- `metrics.queue.heavy.runtime_limit/running/max_running_seen`
+- `metrics.queue.light.size/capacity/concurrency`
 - `metrics.image_jobs.submitted_total/succeeded_total/failed_total/last_duration_ms/avg_duration_ms`
 - `metrics.asr_jobs.submitted_total/succeeded_total/failed_total/last_duration_ms/avg_duration_ms`
+- `metrics.ui_parse_jobs.submitted_total/succeeded_total/failed_total/last_duration_ms/avg_duration_ms/last_elements_count/last_engine_mode`
 - `metrics.gpu_memory.*`（含 `used_ratio`）与 `metrics.gpu_memory.guard.*`（熔断状态）
 
 示例：
@@ -225,12 +269,16 @@ curl -s "http://127.0.0.1:8000/healthz" | jq '.metrics'
 - `CORS_ALLOW_ORIGINS` 默认 `*`，可配置为逗号分隔白名单（例如 `http://localhost:3000,https://your-ui.example.com`）
 - `CORS_ALLOW_CREDENTIALS` 默认 `false`
 - `PORT` 默认 `8000`
-- `MAX_QUEUE_SIZE` 默认 `16`
+- `MAX_QUEUE_SIZE` 默认 `16`（兼容旧配置，作为 `HEAVY_QUEUE_MAX_SIZE` 的默认值）
+- `HEAVY_QUEUE_MAX_SIZE` 默认继承 `MAX_QUEUE_SIZE`（heavy: image_gen + ui_parse）
+- `LIGHT_QUEUE_MAX_SIZE` 默认 `16`（light: asr_whisper_small）
+- `HEAVY_QUEUE_CONCURRENCY` 默认 `1`（worker 数；实际 heavy 推理并发由运行时硬限制为 1）
+- `LIGHT_QUEUE_CONCURRENCY` 默认 `2`
 - `MAX_STEPS` 默认 `30`
 - `MAX_WIDTH` 默认 `768`
 - `MAX_HEIGHT` 默认 `768`
 - `MOCK_ASR=1` 可启用 ASR mock 返回（用于本地联调）
-- `GPU_MEMORY_BREAKER_THRESHOLD_RATIO` 默认 `0.92`，当当前 `used_ratio` 超阈值时拒绝新的重任务（当前为 image 任务）
+- `GPU_MEMORY_BREAKER_THRESHOLD_RATIO` 默认 `0.92`，当当前 `used_ratio` 超阈值时拒绝新的重任务（image/ui_parse）
 - `GPU_MEMORY_FORCE_OPEN=1` 可强制打开熔断（用于演练/测试）
 - `OMNIPARSER_ENABLED` 默认 `0`，开启后在安装阶段拉取 OmniParser 依赖并可初始化权重
 - `OMNIPARSER_REPO_URL` 默认 `https://github.com/microsoft/OmniParser.git`
@@ -238,7 +286,10 @@ curl -s "http://127.0.0.1:8000/healthz" | jq '.metrics'
 - `OMNIPARSER_DIR` 默认 `/content/.cache/omniparser/repo`
 - `OMNIPARSER_WEIGHTS_DIR` 默认 `/content/.cache/omniparser/weights`
 - `OMNIPARSER_DOWNLOAD_WEIGHTS` 默认 `1`
-- `MOCK_UIPARSE` 默认 `1`，用于返回稳定的 mock/placeholder UI 解析结果
+- `OMNIPARSER_CAPTION_MODEL_NAME` 默认 `florence2`
+- `OMNIPARSER_BOX_THRESHOLD` 默认 `0.05`
+- `OMNIPARSER_DEFAULT_CONFIDENCE` 默认 `0.5`（当 OmniParser 输出不含置信度时使用）
+- `MOCK_UIPARSE` 默认 `1`，为 `0` 时调用 OmniParser 原生推理
 - `UI_PARSE_MAX_UPLOAD_BYTES` 默认 `10485760`（10MB）
 - `CF_TUNNEL_TOKEN` 为空时使用 Quick Tunnel
 

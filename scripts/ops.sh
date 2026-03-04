@@ -11,6 +11,7 @@ Usage:
   bash scripts/ops.sh status
   bash scripts/ops.sh stop
   bash scripts/ops.sh restart
+  bash scripts/ops.sh verify-uiparse [--base-url <url>] [--expect-engine-mode <mode>] [--image <path>] [--timeout-sec <n>] [--dump-json]
   bash scripts/ops.sh recycle --endpoint <assignment-endpoint> [--pkg <npx-package-spec>] [--dry-run]
 
 Commands:
@@ -18,7 +19,16 @@ Commands:
   status     Show current process and tunnel status.
   stop       Stop API + cloudflared and remove state file.
   restart    Stop then start.
+  verify-uiparse
+             Verify /ui/parse and print evidence fields for M5 acceptance.
   recycle    Stop service, then remove Colab assignment (if endpoint provided).
+
+Options (verify-uiparse):
+  --base-url            Service base URL. Defaults to http://127.0.0.1:$PORT from state/env.
+  --expect-engine-mode  Expected engine mode, default: native.
+  --image               Optional local image path for parsing.
+  --timeout-sec         HTTP timeout seconds, default: 180.
+  --dump-json           Print full health/ui_parse JSON.
 
 Options (recycle):
   --endpoint   Colab assignment endpoint, for example: m-s-abc123
@@ -49,6 +59,79 @@ cmd_stop() {
 cmd_restart() {
   cmd_stop
   cmd_start
+}
+
+cmd_verify_uiparse() {
+  local state_dir="${STATE_DIR:-/tmp/colab-imagegen}"
+  local state_file="$state_dir/service.env"
+  local base_url="${VERIFY_BASE_URL:-}"
+  local expect_mode="native"
+  local image_path=""
+  local timeout_sec="180"
+  local dump_json="0"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --base-url)
+        base_url="${2:-}"
+        shift 2
+        ;;
+      --expect-engine-mode)
+        expect_mode="${2:-}"
+        shift 2
+        ;;
+      --image)
+        image_path="${2:-}"
+        shift 2
+        ;;
+      --timeout-sec)
+        timeout_sec="${2:-}"
+        shift 2
+        ;;
+      --dump-json)
+        dump_json="1"
+        shift
+        ;;
+      *)
+        echo "[ops] unknown option for verify-uiparse: $1" >&2
+        usage
+        return 2
+        ;;
+    esac
+  done
+
+  if [ -z "$base_url" ]; then
+    local port="${PORT:-}"
+    if [ -z "$port" ] && [ -f "$state_file" ]; then
+      # shellcheck source=/dev/null
+      source "$state_file" || true
+      port="${PORT:-}"
+    fi
+    if [ -z "$port" ]; then
+      port="8000"
+    fi
+    base_url="http://127.0.0.1:${port}"
+  fi
+
+  if [ -z "${API_BEARER_TOKEN:-}" ]; then
+    echo "[ops] API_BEARER_TOKEN is required for verify-uiparse" >&2
+    return 2
+  fi
+
+  local cmd=(python "$SCRIPTS_DIR/verify_uiparse_native.py"
+    --base-url "$base_url"
+    --expect-engine-mode "$expect_mode"
+    --timeout-sec "$timeout_sec")
+
+  if [ -n "$image_path" ]; then
+    cmd+=(--image "$image_path")
+  fi
+  if [ "$dump_json" = "1" ]; then
+    cmd+=(--dump-json)
+  fi
+
+  echo "[ops] verify-uiparse base_url=$base_url expect_engine_mode=$expect_mode"
+  "${cmd[@]}"
 }
 
 cmd_recycle() {
@@ -116,6 +199,9 @@ main() {
       ;;
     restart)
       cmd_restart "$@"
+      ;;
+    verify-uiparse)
+      cmd_verify_uiparse "$@"
       ;;
     recycle)
       cmd_recycle "$@"
