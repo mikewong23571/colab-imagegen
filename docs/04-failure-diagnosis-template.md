@@ -32,11 +32,11 @@ cat /tmp/colab-imagegen/service.env
 
 ## 3. 故障分类（勾选）
 
-- [ ] `401` 鉴权失败：`Missing bearer token` / `Invalid bearer token`
-- [ ] `429` 队列满：`Queue is full`
-- [ ] `429` 显存熔断：`gpu memory guard is open (...)`
-- [ ] `400` 参数非法：尺寸、步数、文件类型、空文件
-- [ ] `500` 推理失败：模型加载/执行异常
+- [ ] `401` 鉴权失败 (`auth_error`)：`Missing bearer token` / `Invalid bearer token`
+- [ ] `429` 队列满 (`queue_full`)：`Queue is full`，系统建议根据 `retry_strategy` 自动重试
+- [ ] `429` 显存熔断 (`circuit_breaker`)：`gpu memory guard is open (...)`，重试建议 `backoff_ms=5000`
+- [ ] `400/404/413/422` 请求异常 (`invalid_request`)：尺寸、步数、文件类型、空文件或参数校验失败
+- [ ] `500` 推理失败 (`internal_error`)：模型加载/执行异常
 - [ ] tunnel 异常：公网地址不可达、cloudflared 退出
 - [ ] 其他（补充）：
 
