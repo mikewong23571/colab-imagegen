@@ -29,7 +29,7 @@ export CORS_ALLOW_ORIGINS='{CORS_ALLOW_ORIGINS}'
 export CORS_ALLOW_CREDENTIALS='{CORS_ALLOW_CREDENTIALS}'
 
 bash scripts/install_runtime.sh
-bash scripts/start_service.sh
+bash scripts/ops.sh start
 """
 
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)

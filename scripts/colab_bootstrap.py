@@ -3,8 +3,8 @@
 Bootstrap executor for colab-run.yaml.
 
 Usage:
-  python skills/colab-cli/scripts/colab_bootstrap.py --config colab-run.yaml
-  python skills/colab-cli/scripts/colab_bootstrap.py --config colab-run.yaml --dry-run
+  python scripts/colab_bootstrap.py --config colab-run.yaml
+  python scripts/colab_bootstrap.py --config colab-run.yaml --dry-run
 """
 
 from __future__ import annotations

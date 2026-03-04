@@ -21,6 +21,13 @@ runtime:
     MAX_STEPS: "30"
     MAX_WIDTH: "768"
     MAX_HEIGHT: "768"
+    # OmniParser: default off. Set to "1" for personal/non-commercial usage in this project.
+    OMNIPARSER_ENABLED: "0"
+    OMNIPARSER_REPO_URL: https://github.com/microsoft/OmniParser.git
+    OMNIPARSER_REPO_REF: master
+    OMNIPARSER_DIR: /content/.cache/omniparser/repo
+    OMNIPARSER_WEIGHTS_DIR: /content/.cache/omniparser/weights
+    OMNIPARSER_DOWNLOAD_WEIGHTS: "1"
     # Set for managed tunnel. Leave empty to use Quick Tunnel.
     CF_TUNNEL_TOKEN: ""
 
@@ -28,4 +35,4 @@ steps:
   install:
     - bash scripts/install_runtime.sh
   run:
-    - bash scripts/start_service.sh
+    - bash scripts/ops.sh start

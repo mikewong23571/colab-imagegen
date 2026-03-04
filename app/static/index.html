@@ -59,6 +59,26 @@
       .muted { color: var(--muted); font-size: 13px; }
       .row { display: flex; gap: 8px; align-items: center; }
       img { max-width: 100%; border-radius: 12px; border: 1px solid var(--border); }
+      .tabs {
+        display: flex;
+        gap: 8px;
+      }
+      .tab {
+        width: auto;
+        padding: 8px 14px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: #eef3ff;
+        color: var(--muted);
+        cursor: pointer;
+      }
+      .tab.active {
+        background: linear-gradient(135deg, #2f7bff, var(--accent));
+        color: #fff;
+        border-color: transparent;
+      }
+      .pane { display: none; }
+      .pane.active { display: block; }
       .placeholder {
         border: 1px dashed var(--border);
         border-radius: 12px;
@@ -92,39 +112,101 @@
       </div>
 
       <div class="card">
-        <div>
-          <label>Prompt</label>
-          <textarea id="prompt">a cinematic mountain landscape, golden hour</textarea>
-        </div>
-        <div>
-          <label>Negative Prompt</label>
-          <input id="negative" placeholder="optional" />
-        </div>
-        <div class="grid" style="margin-top: 12px;">
-          <div><label>Width</label><input id="width" type="number" value="512" /></div>
-          <div><label>Height</label><input id="height" type="number" value="512" /></div>
-          <div><label>Steps</label><input id="steps" type="number" value="20" /></div>
-          <div><label>Guidance</label><input id="guidance" type="number" step="0.1" value="7.0" /></div>
-        </div>
-        <div style="margin-top: 12px;">
-          <button id="generateBtn">Generate</button>
+        <div class="tabs">
+          <button id="imageTab" class="tab active" type="button">Image Gen</button>
+          <button id="asrTab" class="tab" type="button">ASR Whisper</button>
+          <button id="uiTab" class="tab" type="button">UI Parse</button>
         </div>
       </div>
 
-      <div class="card">
-        <div class="row">
-          <strong>状态:</strong>
-          <span id="status">idle</span>
+      <div id="imagePane" class="pane active">
+        <div class="card">
+          <div>
+            <label>Prompt</label>
+            <textarea id="prompt">a cinematic mountain landscape, golden hour</textarea>
+          </div>
+          <div>
+            <label>Negative Prompt</label>
+            <input id="negative" placeholder="optional" />
+          </div>
+          <div class="grid" style="margin-top: 12px;">
+            <div><label>Width</label><input id="width" type="number" value="512" /></div>
+            <div><label>Height</label><input id="height" type="number" value="512" /></div>
+            <div><label>Steps</label><input id="steps" type="number" value="20" /></div>
+            <div><label>Guidance</label><input id="guidance" type="number" step="0.1" value="7.0" /></div>
+          </div>
+          <div style="margin-top: 12px;">
+            <button id="generateBtn">Generate</button>
+          </div>
         </div>
-        <p class="muted" id="jobId"></p>
-        <pre id="statusJson">{}</pre>
+
+        <div class="card">
+          <div class="row">
+            <strong>状态:</strong>
+            <span id="status">idle</span>
+          </div>
+          <p class="muted" id="jobId"></p>
+          <pre id="statusJson">{}</pre>
+        </div>
+
+        <div class="card">
+          <strong>结果</strong>
+          <div style="margin-top: 10px;">
+            <div id="previewPlaceholder" class="placeholder">图片生成后会显示在这里</div>
+            <img id="preview" alt="generated image" style="display:none;" />
+          </div>
+        </div>
       </div>
 
-      <div class="card">
-        <strong>结果</strong>
-        <div style="margin-top: 10px;">
-          <div id="previewPlaceholder" class="placeholder">图片生成后会显示在这里</div>
-          <img id="preview" alt="generated image" style="display:none;" />
+      <div id="asrPane" class="pane">
+        <div class="card">
+          <div>
+            <label>音频文件</label>
+            <input id="asrFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.webm,.mp4" />
+          </div>
+          <div style="margin-top: 12px;">
+            <button id="transcribeBtn">Transcribe</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <strong>状态:</strong>
+            <span id="asrStatus">idle</span>
+          </div>
+          <pre id="asrJson">{}</pre>
+        </div>
+
+        <div class="card">
+          <strong>全文</strong>
+          <pre id="asrText"></pre>
+          <strong>分段与时间戳</strong>
+          <pre id="asrSegments">[]</pre>
+        </div>
+      </div>
+
+      <div id="uiPane" class="pane">
+        <div class="card">
+          <div>
+            <label>UI 截图文件</label>
+            <input id="uiFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp" />
+          </div>
+          <div style="margin-top: 12px;">
+            <button id="uiParseBtn">Parse UI</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <strong>状态:</strong>
+            <span id="uiStatus">idle</span>
+          </div>
+          <pre id="uiJson">{}</pre>
+        </div>
+
+        <div class="card">
+          <strong>识别元素（element/bbox/confidence）</strong>
+          <pre id="uiElements">[]</pre>
         </div>
       </div>
     </div>
@@ -132,6 +214,13 @@
     <script>
       const apiBaseEl = document.getElementById("apiBase");
       const tokenEl = document.getElementById("token");
+      const imageTabEl = document.getElementById("imageTab");
+      const asrTabEl = document.getElementById("asrTab");
+      const uiTabEl = document.getElementById("uiTab");
+      const imagePaneEl = document.getElementById("imagePane");
+      const asrPaneEl = document.getElementById("asrPane");
+      const uiPaneEl = document.getElementById("uiPane");
+
       const promptEl = document.getElementById("prompt");
       const negativeEl = document.getElementById("negative");
       const widthEl = document.getElementById("width");
@@ -143,25 +232,51 @@
       const jobIdEl = document.getElementById("jobId");
       const previewEl = document.getElementById("preview");
       const previewPlaceholderEl = document.getElementById("previewPlaceholder");
-      const btn = document.getElementById("generateBtn");
+      const generateBtnEl = document.getElementById("generateBtn");
+
+      const asrFileEl = document.getElementById("asrFile");
+      const transcribeBtnEl = document.getElementById("transcribeBtn");
+      const asrStatusEl = document.getElementById("asrStatus");
+      const asrJsonEl = document.getElementById("asrJson");
+      const asrTextEl = document.getElementById("asrText");
+      const asrSegmentsEl = document.getElementById("asrSegments");
+
+      const uiFileEl = document.getElementById("uiFile");
+      const uiParseBtnEl = document.getElementById("uiParseBtn");
+      const uiStatusEl = document.getElementById("uiStatus");
+      const uiJsonEl = document.getElementById("uiJson");
+      const uiElementsEl = document.getElementById("uiElements");
 
       apiBaseEl.value = localStorage.getItem("imggen_api_base") || window.location.origin;
       tokenEl.value = localStorage.getItem("imggen_token") || "";
 
-      function headers() {
+      function authHeader() {
         const token = tokenEl.value.trim();
         if (!token) {
           throw new Error("Bearer token 不能为空");
         }
-        return {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-        };
+        return { "Authorization": `Bearer ${token}` };
+      }
+
+      function jsonHeaders() {
+        return { "Content-Type": "application/json", ...authHeader() };
+      }
+
+      function setTab(tab) {
+        const imageActive = tab === "image";
+        const asrActive = tab === "asr";
+        const uiActive = tab === "ui";
+        imageTabEl.classList.toggle("active", imageActive);
+        asrTabEl.classList.toggle("active", asrActive);
+        uiTabEl.classList.toggle("active", uiActive);
+        imagePaneEl.classList.toggle("active", imageActive);
+        asrPaneEl.classList.toggle("active", asrActive);
+        uiPaneEl.classList.toggle("active", uiActive);
       }
 
       async function pollJob(base, id) {
         for (let i = 0; i < 240; i++) {
-          const res = await fetch(`${base}/jobs/${id}`, { headers: { "Authorization": headers().Authorization } });
+          const res = await fetch(`${base}/jobs/${id}`, { headers: authHeader() });
           const data = await res.json();
           statusJsonEl.textContent = JSON.stringify(data, null, 2);
           statusEl.textContent = data.status;
@@ -177,7 +292,7 @@
       }
 
       async function fetchImage(base, id) {
-        const res = await fetch(`${base}/jobs/${id}/image`, { headers: { "Authorization": headers().Authorization } });
+        const res = await fetch(`${base}/jobs/${id}/image`, { headers: authHeader() });
         if (!res.ok) {
           throw new Error(`下载图片失败: ${res.status}`);
         }
@@ -185,8 +300,12 @@
         return URL.createObjectURL(blob);
       }
 
-      btn.addEventListener("click", async () => {
-        btn.disabled = true;
+      imageTabEl.addEventListener("click", () => setTab("image"));
+      asrTabEl.addEventListener("click", () => setTab("asr"));
+      uiTabEl.addEventListener("click", () => setTab("ui"));
+
+      generateBtnEl.addEventListener("click", async () => {
+        generateBtnEl.disabled = true;
         previewEl.style.display = "none";
         previewEl.removeAttribute("src");
         previewPlaceholderEl.style.display = "flex";
@@ -212,7 +331,7 @@
 
           const resp = await fetch(`${base}/generate`, {
             method: "POST",
-            headers: headers(),
+            headers: jsonHeaders(),
             body: JSON.stringify(payload),
           });
           if (!resp.ok) {
@@ -237,7 +356,87 @@
           previewPlaceholderEl.style.display = "flex";
           previewPlaceholderEl.textContent = "图片暂未可用或生成失败，请重试。";
         } finally {
-          btn.disabled = false;
+          generateBtnEl.disabled = false;
+        }
+      });
+
+      transcribeBtnEl.addEventListener("click", async () => {
+        transcribeBtnEl.disabled = true;
+        asrStatusEl.textContent = "submitting";
+        asrJsonEl.textContent = "{}";
+        asrTextEl.textContent = "";
+        asrSegmentsEl.textContent = "[]";
+        try {
+          const base = apiBaseEl.value.trim().replace(/\/$/, "");
+          if (!base) {
+            throw new Error("API Base 不能为空");
+          }
+          const file = asrFileEl.files?.[0];
+          if (!file) {
+            throw new Error("请先选择音频文件");
+          }
+          localStorage.setItem("imggen_api_base", base);
+          localStorage.setItem("imggen_token", tokenEl.value.trim());
+
+          const form = new FormData();
+          form.append("file", file);
+          const resp = await fetch(`${base}/asr/whisper/transcribe`, {
+            method: "POST",
+            headers: authHeader(),
+            body: form,
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(`提交失败: ${resp.status} ${JSON.stringify(data)}`);
+          }
+          asrStatusEl.textContent = data.status || "succeeded";
+          asrJsonEl.textContent = JSON.stringify(data, null, 2);
+          asrTextEl.textContent = data.text || "";
+          asrSegmentsEl.textContent = JSON.stringify(data.segments || [], null, 2);
+        } catch (err) {
+          asrStatusEl.textContent = "error";
+          asrJsonEl.textContent = String(err);
+        } finally {
+          transcribeBtnEl.disabled = false;
+        }
+      });
+
+      uiParseBtnEl.addEventListener("click", async () => {
+        uiParseBtnEl.disabled = true;
+        uiStatusEl.textContent = "submitting";
+        uiJsonEl.textContent = "{}";
+        uiElementsEl.textContent = "[]";
+        try {
+          const base = apiBaseEl.value.trim().replace(/\/$/, "");
+          if (!base) {
+            throw new Error("API Base 不能为空");
+          }
+          const file = uiFileEl.files?.[0];
+          if (!file) {
+            throw new Error("请先选择截图文件");
+          }
+          localStorage.setItem("imggen_api_base", base);
+          localStorage.setItem("imggen_token", tokenEl.value.trim());
+
+          const form = new FormData();
+          form.append("file", file);
+          const resp = await fetch(`${base}/ui/parse`, {
+            method: "POST",
+            headers: authHeader(),
+            body: form,
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(`提交失败: ${resp.status} ${JSON.stringify(data)}`);
+          }
+          uiStatusEl.textContent = data.status || "succeeded";
+          uiJsonEl.textContent = JSON.stringify(data, null, 2);
+          uiElementsEl.textContent = JSON.stringify(data.elements || [], null, 2);
+        } catch (err) {
+          uiStatusEl.textContent = "error";
+          uiJsonEl.textContent = String(err);
+        } finally {
+          uiParseBtnEl.disabled = false;
         }
       });
     </script>
