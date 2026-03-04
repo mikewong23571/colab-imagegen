@@ -190,6 +190,8 @@ export OMNIPARSER_DOWNLOAD_WEIGHTS=1
 bash scripts/install_runtime.sh
 ```
 
+说明：安装脚本在 `OMNIPARSER_ENABLED=1` 分支会补充 OmniParser 兼容依赖 pin（当前包含 `paddleocr<3`、`transformers==4.53.3`、`langchain<0.2`），用于适配 Colab 上游包变更带来的运行时不兼容。
+
 启用真实 OmniParser 推理（非 mock）：
 
 ```bash

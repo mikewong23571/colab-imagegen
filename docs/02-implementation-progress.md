@@ -19,7 +19,7 @@
 | M2 | OmniParser 集成与 UI 解析 API 发布 | done |
 | M3 | 多能力统一调度与资源治理 | done |
 | M4 | 运维自动化与观测增强 | done |
-| M5 | OmniParser 原生推理落地（去 placeholder） | in_progress |
+| M5 | OmniParser 原生推理落地（去 placeholder） | done |
 
 ## 2. 任务分解
 
@@ -77,7 +77,7 @@
 | ID | 任务 | 状态 | 完成日期 | 备注 |
 |---|---|---|---|---|
 | M5-1 | `/ui/parse` 替换 placeholder，接入 OmniParser 原生解析 | done | 2026-03-04 | `app/main.py`：`OmniParserEngine` 新增懒加载原生引擎（`util.omniparser.Omniparser`）、repo/weights 校验、bbox 比例->像素归一化、`engine_mode=native` 返回；`healthz.omniparser` 新增 `engine_mode/reason/loaded/load_error/caption_model_name/box_threshold`。验证：`python -m compileall app/main.py`；`API_BEARER_TOKEN=dev-token MOCK_IMAGEGEN=1 MOCK_ASR=1 MOCK_UIPARSE=1 OMNIPARSER_ENABLED=1 python - <<'PY' ... TestClient /ui/parse ...` 输出 `ui_parse_status=succeeded`、`ui_parse_engine_mode=mock`；`API_BEARER_TOKEN=dev-token MOCK_IMAGEGEN=1 MOCK_ASR=1 MOCK_UIPARSE=1 python - <<'PY' ... FakeParser ...` 输出 `native_mode=native` 与归一化元素坐标。 |
-| M5-2 | Colab T4 真机验证（`MOCK_UIPARSE=0`）并沉淀耗时/稳定性数据 | in_progress | - | 本轮补齐验收工具链：`app/main.py` 新增 `/ui/parse` 原生模式预检查（未就绪直接 `503 service_unavailable`，不占用 heavy 队列）与 `metrics.ui_parse_jobs` 指标（submitted/succeeded/failed/last/avg/last_elements_count/last_engine_mode）；新增 `scripts/verify_uiparse_native.py` 一键验收脚本（采集 `health.omniparser` + `/ui/parse` + `health.metrics.ui_parse_jobs`），并在 `scripts/ops.sh` 增加 `verify-uiparse` 统一命令入口。本地验证：`python -m compileall app/main.py scripts/verify_uiparse_native.py`；`API_BEARER_TOKEN=dev-token MOCK_IMAGEGEN=1 MOCK_ASR=1 MOCK_UIPARSE=1 OMNIPARSER_ENABLED=1 python -m uvicorn app.main:app --host 127.0.0.1 --port 8010` + `bash scripts/ops.sh verify-uiparse --base-url http://127.0.0.1:8010 --expect-engine-mode mock` 输出 `verify_passed=1` 与 `ui_parse_jobs.succeeded_total=1`。真机 T4 原生推理结果待补。 |
+| M5-2 | Colab T4 真机验证（`MOCK_UIPARSE=0`）并沉淀耗时/稳定性数据 | done | 2026-03-04 | 已完成真机闭环：1) 通过 `colab-cli` 在 `gpu-t4-s-1vhtgwz6fgjnk` 拉取 `main` 并执行 `OMNIPARSER_ENABLED=1 OMNIPARSER_DOWNLOAD_WEIGHTS=0 bash scripts/install_runtime.sh`；2) 为修复真机初始化失败，`scripts/install_runtime.sh` 增加 OmniParser 兼容依赖钉住（`paddleocr<3`、`transformers==4.53.3`、`langchain<0.2`）；3) 运行 `python scripts/verify_uiparse_native.py --base-url http://127.0.0.1:8000 --expect-engine-mode native --timeout-sec 1200` 输出 `verify_passed=1`。证据：`ui_parse.engine_mode=native`、`ui_parse.elements_count=4`、`ui_parse.elapsed_ms=19235`、`ui_parse.parse_id=d0bf02f7-4cf6-494b-98ef-2f83cf0443f4`、`health.metrics.ui_parse_jobs.succeeded_total=1`。 |
 
 ## 3. 当前阻塞项
 
@@ -87,8 +87,8 @@
 
 ## 4. 下一个执行周期（Next Sprint）
 
-1. 目标：完成 OmniParser 原生推理真机验收与参数调优闭环。
+1. 目标：推进 M5 后续稳定化（冷启动耗时与依赖冲突收敛）。
 2. 验收标准：
-- 在 Colab T4 设置 `OMNIPARSER_ENABLED=1` + `MOCK_UIPARSE=0` 后，`POST /ui/parse` 稳定返回 `engine_mode=native`；
-- 记录至少一次真实样例输出（元素数量、字段完整性、耗时）并回写本文档；
-- 如遇失败，按 `docs/04-failure-diagnosis-template.md` 留存诊断与补救记录。
+- 在 T4 上将 `/ui/parse` 冷启动耗时（当前样例约 19.2s）优化到可接受范围并记录对比；
+- 评估并最小化 `install_runtime.sh` 中兼容性 pin 对其他 Colab 包的副作用；
+- 补充一条自动化回归（至少 mock + native import smoke）防止依赖回归。
