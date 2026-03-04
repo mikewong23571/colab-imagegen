@@ -59,6 +59,18 @@
       .muted { color: var(--muted); font-size: 13px; }
       .row { display: flex; gap: 8px; align-items: center; }
       img { max-width: 100%; border-radius: 12px; border: 1px solid var(--border); }
+      .placeholder {
+        border: 1px dashed var(--border);
+        border-radius: 12px;
+        background: #f3f6fc;
+        color: var(--muted);
+        min-height: 280px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 12px;
+      }
       pre { white-space: pre-wrap; word-break: break-word; background: #f3f6fc; padding: 10px; border-radius: 10px; }
     </style>
   </head>
@@ -110,7 +122,10 @@
 
       <div class="card">
         <strong>结果</strong>
-        <div style="margin-top: 10px;"><img id="preview" alt="generated image" /></div>
+        <div style="margin-top: 10px;">
+          <div id="previewPlaceholder" class="placeholder">图片生成后会显示在这里</div>
+          <img id="preview" alt="generated image" style="display:none;" />
+        </div>
       </div>
     </div>
 
@@ -127,6 +142,7 @@
       const statusJsonEl = document.getElementById("statusJson");
       const jobIdEl = document.getElementById("jobId");
       const previewEl = document.getElementById("preview");
+      const previewPlaceholderEl = document.getElementById("previewPlaceholder");
       const btn = document.getElementById("generateBtn");
 
       apiBaseEl.value = localStorage.getItem("imggen_api_base") || window.location.origin;
@@ -171,7 +187,10 @@
 
       btn.addEventListener("click", async () => {
         btn.disabled = true;
-        previewEl.src = "";
+        previewEl.style.display = "none";
+        previewEl.removeAttribute("src");
+        previewPlaceholderEl.style.display = "flex";
+        previewPlaceholderEl.textContent = "正在生成图片，请稍候...";
         statusEl.textContent = "submitting";
         try {
           const base = apiBaseEl.value.trim().replace(/\/$/, "");
@@ -208,9 +227,15 @@
           await pollJob(base, accepted.job_id);
           const imageUrl = await fetchImage(base, accepted.job_id);
           previewEl.src = imageUrl;
+          previewEl.style.display = "block";
+          previewPlaceholderEl.style.display = "none";
         } catch (err) {
           statusEl.textContent = "error";
           statusJsonEl.textContent = String(err);
+          previewEl.style.display = "none";
+          previewEl.removeAttribute("src");
+          previewPlaceholderEl.style.display = "flex";
+          previewPlaceholderEl.textContent = "图片暂未可用或生成失败，请重试。";
         } finally {
           btn.disabled = false;
         }

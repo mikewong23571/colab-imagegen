@@ -2,6 +2,12 @@
 
 在 Colab T4 runtime 上运行的图片生成服务骨架，支持通过 `cloudflared` 暴露 API。
 
+## 项目文档入口
+
+- `docs/01-architecture-and-goals.md`: 运行架构与目标。
+- `docs/02-implementation-progress.md`: 计划落地进度跟踪（唯一事实源）。
+- `docs/03-agent-progress-prompt.md`: 纯净 agent prompt（要求先读计划并更新进度）。
+
 ## 落地计划
 
 1. 先用 `colab-cli` 分配 T4，并在 runtime 内按固定 commit 拉取代码。
