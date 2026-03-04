@@ -19,6 +19,9 @@ fi
 cd '{REPO_DIR}'
 git fetch --all --tags
 git checkout '{REPO_REF}'
+if git show-ref --verify --quiet 'refs/remotes/origin/{REPO_REF}'; then
+  git reset --hard 'origin/{REPO_REF}'
+fi
 
 export API_BEARER_TOKEN='{API_BEARER_TOKEN}'
 export OUTPUT_DIR='{OUTPUT_DIR}'
