@@ -2,7 +2,7 @@ import os
 import subprocess
 
 REPO_URL = os.getenv("REPO_URL", "https://github.com/mikewong23571/colab-imagegen.git")
-REPO_REF = os.getenv("REPO_REF", "8a4dbe031554e4b6cb3cc11377c687999a73e8c3")
+REPO_REF = os.getenv("REPO_REF", "main")
 REPO_DIR = os.getenv("REPO_DIR", "/content/colab-imagegen")
 LOG_PATH = os.getenv("BOOTSTRAP_LOG", "/tmp/colab-imagegen-bootstrap.log")
 
