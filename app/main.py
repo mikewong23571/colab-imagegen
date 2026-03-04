@@ -10,10 +10,9 @@ from dataclasses import dataclass
 from typing import Literal
 from contextlib import asynccontextmanager
 
-from diffusers import StableDiffusionPipeline
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 
 
@@ -58,9 +57,16 @@ class ImageGenerator:
         self.model_id = os.getenv("MODEL_ID", "runwayml/stable-diffusion-v1-5")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.torch_dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self._pipe: StableDiffusionPipeline | None = None
+        self.mock_mode = os.getenv("MOCK_IMAGEGEN", "0") == "1"
+        self._pipe: object | None = None
 
     def load(self) -> None:
+        if self.mock_mode:
+            self._pipe = "mock"
+            return
+
+        from diffusers import StableDiffusionPipeline
+
         pipe = StableDiffusionPipeline.from_pretrained(
             self.model_id,
             torch_dtype=self.torch_dtype,
@@ -83,6 +89,14 @@ class ImageGenerator:
     def generate(self, req: GenerateRequest) -> bytes:
         if self._pipe is None:
             raise RuntimeError("Pipeline has not been loaded")
+
+        if self.mock_mode:
+            image = Image.new("RGB", (req.width, req.height), color=(25, 42, 78))
+            draw = ImageDraw.Draw(image)
+            draw.text((16, 16), f"MOCK\\n{req.prompt[:80]}", fill=(240, 240, 240))
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
 
         generator = None
         if req.seed is not None:

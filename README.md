@@ -90,6 +90,12 @@ curl -X POST "http://127.0.0.1:8000/generate" \
   }'
 ```
 
+本地快速验证（不下载模型）可使用：
+
+```bash
+MOCK_IMAGEGEN=1 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
 ### 5) 停止与回收
 
 在 runtime shell 里：
