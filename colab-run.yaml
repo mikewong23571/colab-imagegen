@@ -1,0 +1,27 @@
+schema_version: 1
+
+repo:
+  # Replace with your repository URL and pin to an exact commit SHA.
+  url: https://github.com/<owner>/<repo>.git
+  ref: <commit-sha>
+  local_dir: /content/workspace/colab-imagegen
+
+runtime:
+  workdir: .
+  env:
+    PYTHONUNBUFFERED: "1"
+    HF_HOME: /content/.cache/huggingface
+    PORT: "8000"
+    MODEL_ID: runwayml/stable-diffusion-v1-5
+    MAX_QUEUE_SIZE: "16"
+    MAX_STEPS: "30"
+    MAX_WIDTH: "768"
+    MAX_HEIGHT: "768"
+    # Set for managed tunnel. Leave empty to use Quick Tunnel.
+    CF_TUNNEL_TOKEN: ""
+
+steps:
+  install:
+    - bash scripts/install_runtime.sh
+  run:
+    - bash scripts/start_service.sh
