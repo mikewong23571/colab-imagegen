@@ -28,6 +28,8 @@ runtime:
     OMNIPARSER_DIR: /content/.cache/omniparser/repo
     OMNIPARSER_WEIGHTS_DIR: /content/.cache/omniparser/weights
     OMNIPARSER_DOWNLOAD_WEIGHTS: "1"
+    # Preload native OmniParser at service startup to reduce first /ui/parse latency.
+    OMNIPARSER_PRELOAD_ON_START: "1"
     # Set for managed tunnel. Leave empty to use Quick Tunnel.
     CF_TUNNEL_TOKEN: ""
 

@@ -92,126 +92,171 @@
         padding: 12px;
       }
       pre { white-space: pre-wrap; word-break: break-word; background: #f3f6fc; padding: 10px; border-radius: 10px; }
+      .boot-title {
+        margin: 0;
+        font-size: 22px;
+      }
+      .boot-status {
+        display: inline-block;
+        margin-top: 8px;
+        border-radius: 999px;
+        padding: 4px 10px;
+        border: 1px solid var(--border);
+        background: #eef3ff;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .boot-status.ready {
+        background: #e8f9ef;
+        color: #12753c;
+        border-color: #bde7cc;
+      }
+      .boot-status.error {
+        background: #ffecec;
+        color: #ae1f1f;
+        border-color: #f0bcbc;
+      }
     </style>
   </head>
   <body>
     <div class="wrap">
-      <div class="card">
-        <h1>Colab Image Gen</h1>
-        <p class="muted">本页可本地或远程使用。远程调用时请填 API Base 和 Bearer Token。</p>
-        <div class="grid">
-          <div>
-            <label>API Base</label>
-            <input id="apiBase" placeholder="https://xxxx.trycloudflare.com" />
-          </div>
-          <div>
-            <label>Bearer Token</label>
-            <input id="token" placeholder="your token" type="password" />
-          </div>
+      <div id="bootPane" class="card">
+        <h1 class="boot-title">应用启动中</h1>
+        <p id="bootMessage" class="muted">正在检查服务就绪状态...</p>
+        <span id="bootStatus" class="boot-status">starting</span>
+        <div style="margin-top: 12px;">
+          <button id="readyRetryBtn" type="button">重新检查</button>
+        </div>
+        <div style="margin-top: 12px;">
+          <label>/ready 响应</label>
+          <pre id="readyJson">{}</pre>
         </div>
       </div>
 
-      <div class="card">
-        <div class="tabs">
-          <button id="imageTab" class="tab active" type="button">Image Gen</button>
-          <button id="asrTab" class="tab" type="button">ASR Whisper</button>
-          <button id="uiTab" class="tab" type="button">UI Parse</button>
-        </div>
-      </div>
-
-      <div id="imagePane" class="pane active">
+      <div id="appShell" style="display:none;">
         <div class="card">
-          <div>
-            <label>Prompt</label>
-            <textarea id="prompt">a cinematic mountain landscape, golden hour</textarea>
-          </div>
-          <div>
-            <label>Negative Prompt</label>
-            <input id="negative" placeholder="optional" />
-          </div>
-          <div class="grid" style="margin-top: 12px;">
-            <div><label>Width</label><input id="width" type="number" value="512" /></div>
-            <div><label>Height</label><input id="height" type="number" value="512" /></div>
-            <div><label>Steps</label><input id="steps" type="number" value="20" /></div>
-            <div><label>Guidance</label><input id="guidance" type="number" step="0.1" value="7.0" /></div>
-          </div>
-          <div style="margin-top: 12px;">
-            <button id="generateBtn">Generate</button>
+          <h1>Colab Image Gen</h1>
+          <p class="muted">本页可本地或远程使用。远程调用时请填 API Base 和 Bearer Token。</p>
+          <div class="grid">
+            <div>
+              <label>API Base</label>
+              <input id="apiBase" placeholder="https://xxxx.trycloudflare.com" />
+            </div>
+            <div>
+              <label>Bearer Token</label>
+              <input id="token" placeholder="your token" type="password" />
+            </div>
           </div>
         </div>
 
         <div class="card">
-          <div class="row">
-            <strong>状态:</strong>
-            <span id="status">idle</span>
-          </div>
-          <p class="muted" id="jobId"></p>
-          <pre id="statusJson">{}</pre>
-        </div>
-
-        <div class="card">
-          <strong>结果</strong>
-          <div style="margin-top: 10px;">
-            <div id="previewPlaceholder" class="placeholder">图片生成后会显示在这里</div>
-            <img id="preview" alt="generated image" style="display:none;" />
-          </div>
-        </div>
-      </div>
-
-      <div id="asrPane" class="pane">
-        <div class="card">
-          <div>
-            <label>音频文件</label>
-            <input id="asrFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.webm,.mp4" />
-          </div>
-          <div style="margin-top: 12px;">
-            <button id="transcribeBtn">Transcribe</button>
+          <div class="tabs">
+            <button id="imageTab" class="tab active" type="button">Image Gen</button>
+            <button id="asrTab" class="tab" type="button">ASR Whisper</button>
+            <button id="uiTab" class="tab" type="button">UI Parse</button>
           </div>
         </div>
 
-        <div class="card">
-          <div class="row">
-            <strong>状态:</strong>
-            <span id="asrStatus">idle</span>
+        <div id="imagePane" class="pane active">
+          <div class="card">
+            <div>
+              <label>Prompt</label>
+              <textarea id="prompt">a cinematic mountain landscape, golden hour</textarea>
+            </div>
+            <div>
+              <label>Negative Prompt</label>
+              <input id="negative" placeholder="optional" />
+            </div>
+            <div class="grid" style="margin-top: 12px;">
+              <div><label>Width</label><input id="width" type="number" value="512" /></div>
+              <div><label>Height</label><input id="height" type="number" value="512" /></div>
+              <div><label>Steps</label><input id="steps" type="number" value="20" /></div>
+              <div><label>Guidance</label><input id="guidance" type="number" step="0.1" value="7.0" /></div>
+            </div>
+            <div style="margin-top: 12px;">
+              <button id="generateBtn">Generate</button>
+            </div>
           </div>
-          <pre id="asrJson">{}</pre>
+
+          <div class="card">
+            <div class="row">
+              <strong>状态:</strong>
+              <span id="status">idle</span>
+            </div>
+            <p class="muted" id="jobId"></p>
+            <pre id="statusJson">{}</pre>
+          </div>
+
+          <div class="card">
+            <strong>结果</strong>
+            <div style="margin-top: 10px;">
+              <div id="previewPlaceholder" class="placeholder">图片生成后会显示在这里</div>
+              <img id="preview" alt="generated image" style="display:none;" />
+            </div>
+          </div>
         </div>
 
-        <div class="card">
-          <strong>全文</strong>
-          <pre id="asrText"></pre>
-          <strong>分段与时间戳</strong>
-          <pre id="asrSegments">[]</pre>
-        </div>
-      </div>
-
-      <div id="uiPane" class="pane">
-        <div class="card">
-          <div>
-            <label>UI 截图文件</label>
-            <input id="uiFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp" />
+        <div id="asrPane" class="pane">
+          <div class="card">
+            <div>
+              <label>音频文件</label>
+              <input id="asrFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.webm,.mp4" />
+            </div>
+            <div style="margin-top: 12px;">
+              <button id="transcribeBtn">Transcribe</button>
+            </div>
           </div>
-          <div style="margin-top: 12px;">
-            <button id="uiParseBtn">Parse UI</button>
+
+          <div class="card">
+            <div class="row">
+              <strong>状态:</strong>
+              <span id="asrStatus">idle</span>
+            </div>
+            <pre id="asrJson">{}</pre>
+          </div>
+
+          <div class="card">
+            <strong>全文</strong>
+            <pre id="asrText"></pre>
+            <strong>分段与时间戳</strong>
+            <pre id="asrSegments">[]</pre>
           </div>
         </div>
 
-        <div class="card">
-          <div class="row">
-            <strong>状态:</strong>
-            <span id="uiStatus">idle</span>
+        <div id="uiPane" class="pane">
+          <div class="card">
+            <div>
+              <label>UI 截图文件</label>
+              <input id="uiFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp" />
+            </div>
+            <div style="margin-top: 12px;">
+              <button id="uiParseBtn">Parse UI</button>
+            </div>
           </div>
-          <pre id="uiJson">{}</pre>
-        </div>
 
-        <div class="card">
-          <strong>识别元素（element/bbox/confidence）</strong>
-          <pre id="uiElements">[]</pre>
+          <div class="card">
+            <div class="row">
+              <strong>状态:</strong>
+              <span id="uiStatus">idle</span>
+            </div>
+            <pre id="uiJson">{}</pre>
+          </div>
+
+          <div class="card">
+            <strong>识别元素（element/bbox/confidence）</strong>
+            <pre id="uiElements">[]</pre>
+          </div>
         </div>
       </div>
     </div>
 
     <script>
+      const bootPaneEl = document.getElementById("bootPane");
+      const appShellEl = document.getElementById("appShell");
+      const bootStatusEl = document.getElementById("bootStatus");
+      const bootMessageEl = document.getElementById("bootMessage");
+      const readyJsonEl = document.getElementById("readyJson");
+      const readyRetryBtnEl = document.getElementById("readyRetryBtn");
       const apiBaseEl = document.getElementById("apiBase");
       const tokenEl = document.getElementById("token");
       const imageTabEl = document.getElementById("imageTab");
@@ -249,6 +294,95 @@
 
       apiBaseEl.value = localStorage.getItem("imggen_api_base") || window.location.origin;
       tokenEl.value = localStorage.getItem("imggen_token") || "";
+
+      const READY_POLL_INTERVAL_MS = 2000;
+      const READY_MAX_WAIT_MS = 180000;
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function renderBootStatus(kind) {
+        bootStatusEl.classList.remove("ready", "error");
+        if (kind === "ready") {
+          bootStatusEl.classList.add("ready");
+        } else if (kind === "error") {
+          bootStatusEl.classList.add("error");
+        }
+      }
+
+      function setShellVisible(visible) {
+        bootPaneEl.style.display = visible ? "none" : "block";
+        appShellEl.style.display = visible ? "block" : "none";
+      }
+
+      async function fetchReady(base) {
+        const res = await fetch(`${base}/ready`);
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(`ready check failed: ${res.status} ${JSON.stringify(payload)}`);
+        }
+        return payload;
+      }
+
+      async function waitUntilReady() {
+        const base = apiBaseEl.value.trim().replace(/\/$/, "");
+        if (!base) {
+          bootStatusEl.textContent = "error";
+          renderBootStatus("error");
+          bootMessageEl.textContent = "API Base 不能为空";
+          return;
+        }
+        localStorage.setItem("imggen_api_base", base);
+        localStorage.setItem("imggen_token", tokenEl.value.trim());
+
+        setShellVisible(false);
+        readyRetryBtnEl.disabled = true;
+        const startedAt = Date.now();
+        while (true) {
+          const waitedSec = Math.floor((Date.now() - startedAt) / 1000);
+          try {
+            const data = await fetchReady(base);
+            readyJsonEl.textContent = JSON.stringify(data, null, 2);
+            const status = String(data.status || "starting");
+            const reason = String(data.reason || "");
+            const startup = data.startup && typeof data.startup === "object" ? data.startup : {};
+            const startupElapsed = Number(startup.elapsed_sec || 0);
+            const startupTimeout = Number(startup.timeout_sec || 0);
+
+            bootStatusEl.textContent = status;
+            renderBootStatus(status);
+
+            if (data.ready === true) {
+              bootMessageEl.textContent = "应用已就绪";
+              setShellVisible(true);
+              break;
+            }
+
+            bootMessageEl.textContent = `服务启动中（${waitedSec}s）：${reason || "waiting"}`;
+            const startupTimeoutExceeded = startupTimeout > 0 && startupElapsed > startupTimeout;
+            if (status === "error" || startupTimeoutExceeded || Date.now() - startedAt > READY_MAX_WAIT_MS) {
+              bootStatusEl.textContent = "error";
+              renderBootStatus("error");
+              bootMessageEl.textContent = `启动异常：${data.message || reason || "ready check failed"}`;
+              break;
+            }
+          } catch (err) {
+            bootStatusEl.textContent = "starting";
+            renderBootStatus("starting");
+            bootMessageEl.textContent = `等待 /ready 响应（${waitedSec}s）：${String(err)}`;
+            readyJsonEl.textContent = String(err);
+            if (Date.now() - startedAt > READY_MAX_WAIT_MS) {
+              bootStatusEl.textContent = "error";
+              renderBootStatus("error");
+              bootMessageEl.textContent = "启动异常：/ready 长时间无响应";
+              break;
+            }
+          }
+          await sleep(READY_POLL_INTERVAL_MS);
+        }
+        readyRetryBtnEl.disabled = false;
+      }
 
       function authHeader() {
         const token = tokenEl.value.trim();
@@ -439,6 +573,12 @@
           uiParseBtnEl.disabled = false;
         }
       });
+
+      readyRetryBtnEl.addEventListener("click", () => {
+        waitUntilReady();
+      });
+
+      waitUntilReady();
     </script>
   </body>
 </html>

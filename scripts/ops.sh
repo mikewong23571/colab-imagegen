@@ -12,6 +12,9 @@ Usage:
   bash scripts/ops.sh stop
   bash scripts/ops.sh restart
   bash scripts/ops.sh verify-uiparse [--base-url <url>] [--expect-engine-mode <mode>] [--image <path>] [--timeout-sec <n>] [--dump-json]
+  bash scripts/ops.sh verify-uiparse-smoke
+  bash scripts/ops.sh verify-regression
+  bash scripts/ops.sh measure-uiparse-coldstart [--base-url <url>] [--expect-engine-mode <mode>] [--image <path>] [--timeout-sec <n>] [--runs <n>] [--restart-cmd <cmd>] [--restart-wait-timeout-sec <n>] [--pause-sec <n>]
   bash scripts/ops.sh recycle --endpoint <assignment-endpoint> [--pkg <npx-package-spec>] [--dry-run]
 
 Commands:
@@ -21,6 +24,12 @@ Commands:
   restart    Stop then start.
   verify-uiparse
              Verify /ui/parse and print evidence fields for M5 acceptance.
+  verify-uiparse-smoke
+             Run local mock + native import smoke regression for /ui/parse.
+  verify-regression
+             Run image/asr/ui_parse compatibility regression (mock + native import smoke).
+  measure-uiparse-coldstart
+             Measure /ui/parse cold-start/warm-start latency across samples.
   recycle    Stop service, then remove Colab assignment (if endpoint provided).
 
 Options (verify-uiparse):
@@ -134,6 +143,22 @@ cmd_verify_uiparse() {
   "${cmd[@]}"
 }
 
+cmd_verify_uiparse_smoke() {
+  python "$SCRIPTS_DIR/verify_uiparse_smoke.py"
+}
+
+cmd_verify_regression() {
+  python "$SCRIPTS_DIR/verify_runtime_regression.py"
+}
+
+cmd_measure_uiparse_coldstart() {
+  if [ -z "${API_BEARER_TOKEN:-}" ]; then
+    echo "[ops] API_BEARER_TOKEN is required for measure-uiparse-coldstart" >&2
+    return 2
+  fi
+  python "$SCRIPTS_DIR/measure_uiparse_coldstart.py" "$@"
+}
+
 cmd_recycle() {
   local endpoint=""
   local pkg="${COLAB_CLI_PKG:-}"
@@ -202,6 +227,15 @@ main() {
       ;;
     verify-uiparse)
       cmd_verify_uiparse "$@"
+      ;;
+    verify-uiparse-smoke)
+      cmd_verify_uiparse_smoke "$@"
+      ;;
+    verify-regression)
+      cmd_verify_regression "$@"
+      ;;
+    measure-uiparse-coldstart)
+      cmd_measure_uiparse_coldstart "$@"
       ;;
     recycle)
       cmd_recycle "$@"

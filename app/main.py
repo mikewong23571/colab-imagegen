@@ -226,6 +226,10 @@ class ImageGenerator:
 
         self._pipe = pipe
 
+    @property
+    def loaded(self) -> bool:
+        return self._pipe is not None
+
     def generate(self, req: GenerateRequest) -> bytes:
         if self._pipe is None:
             raise RuntimeError("Pipeline has not been loaded")
@@ -370,6 +374,8 @@ class OmniParserEngine:
         self._native_engine: object | None = None
         self._load_error: str | None = None
         self._load_lock = threading.Lock()
+        self._load_attempted = False
+        self._last_load_duration_ms = 0
 
     @property
     def required_paths(self) -> list[Path]:
@@ -397,6 +403,14 @@ class OmniParserEngine:
     @property
     def load_error(self) -> str | None:
         return self._load_error
+
+    @property
+    def load_attempted(self) -> bool:
+        return self._load_attempted
+
+    @property
+    def last_load_duration_ms(self) -> int:
+        return self._last_load_duration_ms
 
     @property
     def engine_mode(self) -> str:
@@ -446,11 +460,20 @@ class OmniParserEngine:
                 return
             if self._load_error is not None:
                 raise RuntimeError(f"failed to initialize omniparser engine: {self._load_error}")
+            self._load_attempted = True
+            start_time = time.perf_counter()
             try:
                 self._load()
+                self._last_load_duration_ms = int((time.perf_counter() - start_time) * 1000)
             except Exception as exc:
+                self._last_load_duration_ms = int((time.perf_counter() - start_time) * 1000)
                 self._load_error = str(exc)
                 raise RuntimeError(f"failed to initialize omniparser engine: {exc}") from exc
+
+    def preload(self) -> None:
+        if not self.enabled or self.mock_mode:
+            return
+        self._ensure_loaded()
 
     def _normalize_bbox(self, raw_bbox: object, width: int, height: int) -> list[float] | None:
         if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
@@ -574,6 +597,9 @@ class OmniParserEngine:
 
 class ServiceState:
     def __init__(self) -> None:
+        self.service_started_at = time.time()
+        self.startup_completed_at: float | None = None
+        self.ready_timeout_sec = _parse_int_env("READY_TIMEOUT_SEC", 300, minimum=10)
         legacy_max_queue_size = _parse_int_env("MAX_QUEUE_SIZE", 16, minimum=1)
         self.heavy_queue_max_size = _parse_int_env(
             "HEAVY_QUEUE_MAX_SIZE",
@@ -596,6 +622,7 @@ class ServiceState:
         self.gpu_breaker_threshold_ratio = float(os.getenv("GPU_MEMORY_BREAKER_THRESHOLD_RATIO", "0.92"))
         self.gpu_breaker_force_open = _parse_bool_env("GPU_MEMORY_FORCE_OPEN", False)
         self.omniparser_enabled = _parse_bool_env("OMNIPARSER_ENABLED", False)
+        self.omniparser_preload_on_start = _parse_bool_env("OMNIPARSER_PRELOAD_ON_START", True)
         self.omniparser_repo_dir = Path(os.getenv("OMNIPARSER_DIR", "/content/.cache/omniparser/repo")).expanduser()
         self.omniparser_weights_dir = Path(
             os.getenv("OMNIPARSER_WEIGHTS_DIR", "/content/.cache/omniparser/weights")
@@ -629,6 +656,7 @@ class ServiceState:
         self.image_paths: dict[str, Path] = {}
         self.heavy_workers: list[asyncio.Task[None]] = []
         self.light_workers: list[asyncio.Task[None]] = []
+        self.omniparser_preload_task: asyncio.Task[None] | None = None
         self.image_submitted_total = 0
         self.image_succeeded_total = 0
         self.image_failed_total = 0
@@ -666,8 +694,19 @@ class ServiceState:
             asyncio.create_task(self._light_worker_loop(index + 1), name=f"light-worker-{index + 1}")
             for index in range(self.light_queue_concurrency)
         ]
+        if self._should_preload_omniparser():
+            self.omniparser_preload_task = asyncio.create_task(
+                self._preload_omniparser_background(),
+                name="omniparser-preload",
+            )
+        self.startup_completed_at = time.time()
 
     async def stop(self) -> None:
+        if self.omniparser_preload_task is not None:
+            self.omniparser_preload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.omniparser_preload_task
+            self.omniparser_preload_task = None
         workers = [*self.heavy_workers, *self.light_workers]
         self.heavy_workers = []
         self.light_workers = []
@@ -676,6 +715,24 @@ class ServiceState:
         for worker in workers:
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
+
+    def _should_preload_omniparser(self) -> bool:
+        if not self.omniparser_preload_on_start:
+            return False
+        if not self.omniparser_enabled:
+            return False
+        if self.omniparser_engine.mock_mode:
+            return False
+        if self.omniparser_engine.loaded:
+            return False
+        return len(self.omniparser_engine.missing_required_paths()) == 0
+
+    async def _preload_omniparser_background(self) -> None:
+        try:
+            await asyncio.to_thread(self.omniparser_engine.preload)
+        except Exception:
+            # Keep service startup non-blocking. Failing details are exposed by healthz/load_error.
+            return
 
     async def submit(self, req: GenerateRequest) -> GenerateAccepted:
         self._validate_request(req)
@@ -854,12 +911,101 @@ class ServiceState:
             },
         }
 
+    def ready(self) -> dict[str, object]:
+        now = time.time()
+        startup_elapsed_sec = round(now - self.service_started_at, 3)
+
+        heavy_workers_started = len(self.heavy_workers) == self.heavy_queue_concurrency
+        light_workers_started = len(self.light_workers) == self.light_queue_concurrency
+        heavy_workers_alive = sum(1 for worker in self.heavy_workers if not worker.done())
+        light_workers_alive = sum(1 for worker in self.light_workers if not worker.done())
+        workers_ready = (
+            heavy_workers_started
+            and light_workers_started
+            and heavy_workers_alive == self.heavy_queue_concurrency
+            and light_workers_alive == self.light_queue_concurrency
+        )
+
+        reason = "ok"
+        ready = bool(self.startup_completed_at is not None and self.generator.loaded and workers_ready)
+        preload_running = self.omniparser_preload_task is not None and not self.omniparser_preload_task.done()
+        needs_omniparser_preload = (
+            self.omniparser_enabled and not self.omniparser_engine.mock_mode and self.omniparser_preload_on_start
+        )
+
+        if ready and needs_omniparser_preload:
+            if self.omniparser_engine.load_error:
+                ready = False
+                reason = "omniparser_load_error"
+            elif preload_running:
+                ready = False
+                reason = "omniparser_preloading"
+            elif not self.omniparser_engine.loaded:
+                ready = False
+                reason = "omniparser_not_loaded"
+
+        if self.startup_completed_at is None:
+            ready = False
+            reason = "startup_not_completed"
+        elif not self.generator.loaded:
+            ready = False
+            reason = "image_generator_not_loaded"
+        elif not workers_ready:
+            ready = False
+            reason = "workers_not_ready"
+
+        timeout = startup_elapsed_sec > float(self.ready_timeout_sec)
+        if not ready and timeout:
+            status = "error"
+            message = f"startup timeout: elapsed={startup_elapsed_sec}s > limit={self.ready_timeout_sec}s"
+        elif ready:
+            status = "ready"
+            message = "service is ready"
+        else:
+            status = "starting"
+            message = "service is starting"
+
+        return {
+            "ready": ready,
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "startup": {
+                "started_at": self.service_started_at,
+                "completed_at": self.startup_completed_at,
+                "elapsed_sec": startup_elapsed_sec,
+                "timeout_sec": self.ready_timeout_sec,
+            },
+            "checks": {
+                "generator_loaded": self.generator.loaded,
+                "heavy_workers_started": heavy_workers_started,
+                "light_workers_started": light_workers_started,
+                "heavy_workers_alive": heavy_workers_alive,
+                "light_workers_alive": light_workers_alive,
+                "heavy_workers_expected": self.heavy_queue_concurrency,
+                "light_workers_expected": self.light_queue_concurrency,
+                "omniparser": {
+                    "enabled": self.omniparser_enabled,
+                    "mock_mode": self.omniparser_engine.mock_mode,
+                    "preload_on_start": self.omniparser_preload_on_start,
+                    "preload_running": preload_running,
+                    "loaded": self.omniparser_engine.loaded,
+                    "load_error": self.omniparser_engine.load_error,
+                    "load_attempted": self.omniparser_engine.load_attempted,
+                    "last_load_duration_ms": self.omniparser_engine.last_load_duration_ms,
+                },
+            },
+        }
+
     def _omniparser_state(self) -> dict[str, object]:
         missing = [str(path) for path in self.omniparser_engine.missing_required_paths()]
+        preload_running = self.omniparser_preload_task is not None and not self.omniparser_preload_task.done()
         if not self.omniparser_enabled:
             reason = "disabled"
         elif self.omniparser_engine.mock_mode:
             reason = "mock_mode"
+        elif preload_running:
+            reason = "preloading"
         elif missing:
             reason = "missing_files"
         elif self.omniparser_engine.load_error:
@@ -877,6 +1023,10 @@ class ServiceState:
             "caption_model_name": self.omniparser_engine.caption_model_name,
             "box_threshold": self.omniparser_engine.box_threshold,
             "loaded": self.omniparser_engine.loaded,
+            "preload_on_start": self.omniparser_preload_on_start,
+            "preload_running": preload_running,
+            "load_attempted": self.omniparser_engine.load_attempted,
+            "last_load_duration_ms": self.omniparser_engine.last_load_duration_ms,
             "missing_files": missing,
         }
         if self.omniparser_engine.load_error:
@@ -1367,6 +1517,11 @@ def index() -> Response:
 @app.get("/healthz")
 def healthz() -> dict[str, object]:
     return state.health()
+
+
+@app.get("/ready")
+def ready() -> dict[str, object]:
+    return state.ready()
 
 
 @app.post("/generate", response_model=GenerateAccepted, status_code=202)

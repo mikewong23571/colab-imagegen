@@ -9,6 +9,7 @@
 - `docs/03-agent-progress-prompt.md`: 纯净 agent prompt（要求先读计划并更新进度）。
 - `docs/04-failure-diagnosis-template.md`: 故障诊断模板（分类、命令、恢复记录）。
 - `docs/05-omniparser-license-checklist.md`: OmniParser 许可合规检查清单（个人非商用/商用前复核）。
+- `docs/06-runtime-compatibility-checklist.md`: Runtime 兼容性检查清单（M6-3，依赖副作用与回归检查）。
 
 ## 落地计划
 
@@ -16,29 +17,36 @@
 2. 执行 `scripts/colab_bootstrap.py --config colab-run.yaml`，自动完成安装与启动。
 3. 服务层保持单进程单 worker，所有请求进入内存队列，避免 T4 显存争抢。
 4. 隧道层默认 Quick Tunnel 验证，生产改成 `CF_TUNNEL_TOKEN` 的 managed tunnel。
-5. 运维层统一使用 `scripts/ops.sh`（start/status/stop/restart/recycle）管理进程与回收，避免命令漂移。
+5. 运维层统一使用 `scripts/ops.sh`（start/status/stop/restart/verify-uiparse/verify-uiparse-smoke/verify-regression/measure-uiparse-coldstart/recycle）管理进程与回收，避免命令漂移。
 
 ## 项目结构
 
 - `app/main.py`: FastAPI 服务、Bearer 鉴权、CORS、任务队列。
 - `app/static/index.html`: 简单前端页面（`/`）。
-- `scripts/ops.sh`: 统一运维入口（start/status/stop/restart/recycle）。
+- `scripts/ops.sh`: 统一运维入口（start/status/stop/restart/verify-uiparse/verify-uiparse-smoke/verify-regression/measure-uiparse-coldstart/recycle）。
 - `scripts/install_runtime.sh`: 安装 Python 依赖与 cloudflared。
 - `scripts/start_service.sh`: 启动 API + cloudflared（底层实现，通常由 `ops.sh start` 调用）。
 - `scripts/service_status.sh`: 查看运行状态与公网地址（底层实现，通常由 `ops.sh status` 调用）。
 - `scripts/stop_service.sh`: 停止服务（底层实现，通常由 `ops.sh stop` 调用）。
+- `scripts/verify_uiparse_native.py`: 真机验收 `/ui/parse`（输出 engine mode、耗时、metrics）。
+- `scripts/verify_uiparse_smoke.py`: 本地 smoke（mock + native import fake repo/weights）。
+- `scripts/verify_runtime_regression.py`: 基础能力回归（image/asr/ui_parse，含 native import smoke）。
+- `scripts/measure_uiparse_coldstart.py`: 冷启动/热启动样本采集脚本（支持重启命令）。
 - `scripts/colab_bootstrap.py`: 读取 `colab-run.yaml` 的配置驱动启动器。
 - `colab-run.yaml`: Colab 启动配置模板。
 
 ## 预置接口
 
 - `GET /healthz`: 健康检查。
+- `GET /ready`: 启动就绪检查（用于前端加载页与启动异常提示）。
 - `GET /`: 简单前端页面。
 - `POST /generate`: 提交图片任务，返回 `job_id`（需要 Bearer Token）。
 - `POST /asr/whisper/transcribe`: 上传音频并返回转写（全文 + 分段 + 时间戳，需要 Bearer Token）。
 - `POST /ui/parse`: 上传 UI 截图并返回结构化元素（`element + bbox + confidence`，需要 Bearer Token）。
 - `GET /jobs/{job_id}`: 查询统一任务状态（支持 image/asr/ui_parse，含 `task_type`，需要 Bearer Token）。
 - `GET /jobs/{job_id}/image`: 下载 PNG（需要 Bearer Token）。
+
+说明：前端页面首次打开时会自动轮询 `/ready`。未就绪时显示加载页；超过超时阈值（`READY_TIMEOUT_SEC`）后显示启动异常。
 
 ## colab-cli 操作流程
 
@@ -191,6 +199,7 @@ bash scripts/install_runtime.sh
 ```
 
 说明：安装脚本在 `OMNIPARSER_ENABLED=1` 分支会补充 OmniParser 兼容依赖 pin（当前包含 `paddleocr<3`、`transformers==4.53.3`、`langchain<0.2`），用于适配 Colab 上游包变更带来的运行时不兼容。
+其中 `langchain` 默认采用 `OMNIPARSER_LANGCHAIN_INSTALL_MODE=no-deps` 以降低依赖级联回退风险。
 
 启用真实 OmniParser 推理（非 mock）：
 
@@ -198,7 +207,7 @@ bash scripts/install_runtime.sh
 export MOCK_UIPARSE=0
 ```
 
-初始化结果可通过 `GET /healthz` 的 `omniparser` 字段查看（`enabled/ready/engine_mode/missing_files/load_error`）。
+初始化结果可通过 `GET /healthz` 的 `omniparser` 字段查看（`enabled/ready/engine_mode/preload_running/load_attempted/last_load_duration_ms/missing_files/load_error`）。
 
 当 `MOCK_UIPARSE=0` 且 OmniParser 依赖/权重未就绪时，`POST /ui/parse` 将直接返回 `503 service_unavailable`（不进入 heavy 队列），用于快速暴露环境问题。
 
@@ -220,6 +229,34 @@ bash scripts/ops.sh verify-uiparse --expect-engine-mode native
 - `health.omniparser.*`（enabled/ready/engine_mode/reason）
 - `ui_parse.engine_mode/elements_count/elapsed_ms/parse_id`
 - `health.metrics.ui_parse_jobs`（提交/成功/失败/耗时/最近元素数）
+
+补充本地回归烟测（mock + native import smoke）：
+
+```bash
+bash scripts/ops.sh verify-uiparse-smoke
+```
+
+等价直接命令：
+
+```bash
+python scripts/verify_uiparse_smoke.py
+```
+
+执行完整基础能力回归（image/asr/ui_parse）：
+
+```bash
+bash scripts/ops.sh verify-regression
+```
+
+在 T4 上采集冷启动对比（建议 3 次样本，重启后测首个请求）：
+
+```bash
+bash scripts/ops.sh measure-uiparse-coldstart \
+  --base-url "http://127.0.0.1:${PORT:-8000}" \
+  --expect-engine-mode native \
+  --runs 3 \
+  --restart-cmd "bash scripts/ops.sh restart"
+```
 
 ### 5) 停止与回收
 
@@ -271,6 +308,7 @@ curl -s "http://127.0.0.1:8000/healthz" | jq '.metrics'
 - `CORS_ALLOW_ORIGINS` 默认 `*`，可配置为逗号分隔白名单（例如 `http://localhost:3000,https://your-ui.example.com`）
 - `CORS_ALLOW_CREDENTIALS` 默认 `false`
 - `PORT` 默认 `8000`
+- `READY_TIMEOUT_SEC` 默认 `300`，`/ready` 判断启动超时阈值（秒）
 - `MAX_QUEUE_SIZE` 默认 `16`（兼容旧配置，作为 `HEAVY_QUEUE_MAX_SIZE` 的默认值）
 - `HEAVY_QUEUE_MAX_SIZE` 默认继承 `MAX_QUEUE_SIZE`（heavy: image_gen + ui_parse）
 - `LIGHT_QUEUE_MAX_SIZE` 默认 `16`（light: asr_whisper_small）
@@ -288,6 +326,9 @@ curl -s "http://127.0.0.1:8000/healthz" | jq '.metrics'
 - `OMNIPARSER_DIR` 默认 `/content/.cache/omniparser/repo`
 - `OMNIPARSER_WEIGHTS_DIR` 默认 `/content/.cache/omniparser/weights`
 - `OMNIPARSER_DOWNLOAD_WEIGHTS` 默认 `1`
+- `OMNIPARSER_LANGCHAIN_INSTALL_MODE` 默认 `no-deps`，可选 `full`
+- `OMNIPARSER_RUN_PIP_CHECK` 默认 `1`，安装后执行 `pip check`（非阻塞）
+- `OMNIPARSER_PRELOAD_ON_START` 默认 `1`，在 native 模式下启动后后台预加载 OmniParser，降低首个 `/ui/parse` 请求延迟
 - `OMNIPARSER_CAPTION_MODEL_NAME` 默认 `florence2`
 - `OMNIPARSER_BOX_THRESHOLD` 默认 `0.05`
 - `OMNIPARSER_DEFAULT_CONFIDENCE` 默认 `0.5`（当 OmniParser 输出不含置信度时使用）

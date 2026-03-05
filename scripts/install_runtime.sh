@@ -27,6 +27,8 @@ if is_true "$OMNIPARSER_ENABLED"; then
   OMNIPARSER_DIR="${OMNIPARSER_DIR:-/content/.cache/omniparser/repo}"
   OMNIPARSER_WEIGHTS_DIR="${OMNIPARSER_WEIGHTS_DIR:-/content/.cache/omniparser/weights}"
   OMNIPARSER_DOWNLOAD_WEIGHTS="${OMNIPARSER_DOWNLOAD_WEIGHTS:-1}"
+  OMNIPARSER_LANGCHAIN_INSTALL_MODE="${OMNIPARSER_LANGCHAIN_INSTALL_MODE:-no-deps}"
+  OMNIPARSER_RUN_PIP_CHECK="${OMNIPARSER_RUN_PIP_CHECK:-1}"
 
   echo "[install][omniparser] enabled=1 repo=${OMNIPARSER_REPO_URL} ref=${OMNIPARSER_REPO_REF}"
   if [ ! -d "${OMNIPARSER_DIR}/.git" ]; then
@@ -43,7 +45,15 @@ if is_true "$OMNIPARSER_ENABLED"; then
   python -m pip install "transformers==4.53.3"
   # paddleocr/paddlex currently imports langchain.docstore.document at runtime.
   # Newer langchain releases removed this module, so pin to a compatible major.
-  python -m pip install "langchain<0.2"
+  case "${OMNIPARSER_LANGCHAIN_INSTALL_MODE,,}" in
+    full)
+      python -m pip install "langchain<0.2"
+      ;;
+    no-deps|nodeps|*)
+      # Prefer no-deps to avoid pulling old dependency constraints (anyio/packaging/tenacity).
+      python -m pip install --no-deps "langchain<0.2"
+      ;;
+  esac
 
   if is_true "$OMNIPARSER_DOWNLOAD_WEIGHTS"; then
     echo "[install][omniparser] downloading weights to ${OMNIPARSER_WEIGHTS_DIR}"
@@ -65,6 +75,10 @@ if is_true "$OMNIPARSER_ENABLED"; then
   fi
 
   echo "[install][omniparser] done"
+  if is_true "$OMNIPARSER_RUN_PIP_CHECK"; then
+    echo "[install][omniparser] pip check (non-fatal)"
+    python -m pip check || true
+  fi
 fi
 
 if command -v cloudflared >/dev/null 2>&1; then

@@ -1,6 +1,6 @@
 # Colab Multi-Model Service: 落地计划与进度追踪
 
-最后更新：2026-03-04
+最后更新：2026-03-05
 负责人：待定（默认当前执行 agent）
 
 ## 0. 使用说明
@@ -20,6 +20,7 @@
 | M3 | 多能力统一调度与资源治理 | done |
 | M4 | 运维自动化与观测增强 | done |
 | M5 | OmniParser 原生推理落地（去 placeholder） | done |
+| M6 | M5 后续稳定化（冷启动与依赖回归防护） | in_progress |
 
 ## 2. 任务分解
 
@@ -79,6 +80,14 @@
 | M5-1 | `/ui/parse` 替换 placeholder，接入 OmniParser 原生解析 | done | 2026-03-04 | `app/main.py`：`OmniParserEngine` 新增懒加载原生引擎（`util.omniparser.Omniparser`）、repo/weights 校验、bbox 比例->像素归一化、`engine_mode=native` 返回；`healthz.omniparser` 新增 `engine_mode/reason/loaded/load_error/caption_model_name/box_threshold`。验证：`python -m compileall app/main.py`；`API_BEARER_TOKEN=dev-token MOCK_IMAGEGEN=1 MOCK_ASR=1 MOCK_UIPARSE=1 OMNIPARSER_ENABLED=1 python - <<'PY' ... TestClient /ui/parse ...` 输出 `ui_parse_status=succeeded`、`ui_parse_engine_mode=mock`；`API_BEARER_TOKEN=dev-token MOCK_IMAGEGEN=1 MOCK_ASR=1 MOCK_UIPARSE=1 python - <<'PY' ... FakeParser ...` 输出 `native_mode=native` 与归一化元素坐标。 |
 | M5-2 | Colab T4 真机验证（`MOCK_UIPARSE=0`）并沉淀耗时/稳定性数据 | done | 2026-03-04 | 已完成真机闭环：1) 通过 `colab-cli` 在 `gpu-t4-s-1vhtgwz6fgjnk` 拉取 `main` 并执行 `OMNIPARSER_ENABLED=1 OMNIPARSER_DOWNLOAD_WEIGHTS=0 bash scripts/install_runtime.sh`；2) 为修复真机初始化失败，`scripts/install_runtime.sh` 增加 OmniParser 兼容依赖钉住（`paddleocr<3`、`transformers==4.53.3`、`langchain<0.2`）；3) 运行 `python scripts/verify_uiparse_native.py --base-url http://127.0.0.1:8000 --expect-engine-mode native --timeout-sec 1200` 输出 `verify_passed=1`。证据：`ui_parse.engine_mode=native`、`ui_parse.elements_count=4`、`ui_parse.elapsed_ms=19235`、`ui_parse.parse_id=d0bf02f7-4cf6-494b-98ef-2f83cf0443f4`、`health.metrics.ui_parse_jobs.succeeded_total=1`。 |
 
+### M6（M5 后续稳定化）
+
+| ID | 任务 | 状态 | 完成日期 | 备注 |
+|---|---|---|---|---|
+| M6-1 | 增加自动化回归：`mock + native import smoke` | done | 2026-03-04 | 新增 `scripts/verify_uiparse_smoke.py`，自动执行两段 smoke（mock 模式 + native import fake repo/weights）；`scripts/ops.sh` 新增 `verify-uiparse-smoke` 命令；`README.md` 增加运行说明。验证：`python scripts/verify_uiparse_smoke.py` 与 `bash scripts/ops.sh verify-uiparse-smoke` 均输出 `verify_uiparse_smoke_passed=1`；`python -m compileall app/main.py scripts/verify_uiparse_smoke.py` 通过；`npx --yes --package=git+https://github.com/mikewong23571/colab-vscode.git#main colab-cli -- help` 返回 `assign/terminal/exec/fs` 子命令列表。 |
+| M6-2 | 优化 `/ui/parse` 冷启动耗时并记录对比 | in_progress |  | 已完成实现：`app/main.py` 新增 `OMNIPARSER_PRELOAD_ON_START` 启动预加载与 `healthz.omniparser` 负载指标（`preload_running/load_attempted/last_load_duration_ms`）；新增 `scripts/measure_uiparse_coldstart.py` 与 `bash scripts/ops.sh measure-uiparse-coldstart`。本地验证：1) `python scripts/measure_uiparse_coldstart.py --base-url http://127.0.0.1:18081 --expect-engine-mode native --runs 2` 输出 `measure_passed=1`、`summary.server_elapsed_ms.first_minus_rest_avg=5`；2) `API_BEARER_TOKEN=dev-token bash scripts/ops.sh measure-uiparse-coldstart --base-url http://127.0.0.1:18082 --expect-engine-mode native --runs 1` 输出 `measure_passed=1`；3) `python -m compileall app/main.py scripts/measure_uiparse_coldstart.py` 通过。T4 真机验证（endpoint=`gpu-t4-s-2y0zjm1nempv2`）：`npx --yes --package=git+https://github.com/mikewong23571/colab-vscode.git#main colab-cli -- exec --assign gpu-t4-s-2y0zjm1nempv2 --file /tmp/colab_remote_measure.py` 输出 `measure_passed=1`，三次 `server_elapsed_ms` 分别为 `80987/16279/16170`，`summary.server_elapsed_ms.rest_avg=16224`，`summary.server_elapsed_ms.first_minus_rest_avg=64763`。新增就绪门控：`GET /ready` 与前端加载页联动（未就绪显示 loading，超时显示异常），验证：`TestClient GET /ready` 在 mock 模式返回 `ready=True`，在 native 且权重缺失场景返回 `ready=False(reason=omniparser_not_loaded)`。结论：重启后首个 native 请求仍明显偏慢（约 81s），后续样本稳定在 ~16.2s，任务保持 `in_progress`。 |
+| M6-3 | 评估 OmniParser 依赖 pin 副作用并最小化 | done | 2026-03-05 | 已完成三项：1) `scripts/install_runtime.sh` 新增 `OMNIPARSER_LANGCHAIN_INSTALL_MODE`（默认 `no-deps`）以减少 `langchain<0.2` 依赖级联回退；2) 新增 `scripts/verify_runtime_regression.py`，覆盖 image/asr/ui_parse 基础回归（含 native import smoke）；3) 新增 `docs/06-runtime-compatibility-checklist.md` 并在 `README.md` 增加入口与命令。验证：`python scripts/verify_runtime_regression.py` 与 `bash scripts/ops.sh verify-regression` 均输出 `verify_runtime_regression_passed=1`；`python -m compileall scripts/verify_runtime_regression.py app/main.py` 通过。 |
+
 ## 3. 当前阻塞项
 
 | ID | 阻塞描述 | 影响范围 | 下一步 |
@@ -87,8 +96,9 @@
 
 ## 4. 下一个执行周期（Next Sprint）
 
-1. 目标：推进 M5 后续稳定化（冷启动耗时与依赖冲突收敛）。
+1. 目标：推进 M6（冷启动耗时与依赖冲突收敛）。
 2. 验收标准：
-- 在 T4 上将 `/ui/parse` 冷启动耗时（当前样例约 19.2s）优化到可接受范围并记录对比；
-- 评估并最小化 `install_runtime.sh` 中兼容性 pin 对其他 Colab 包的副作用；
-- 补充一条自动化回归（至少 mock + native import smoke）防止依赖回归。
+- 在 T4 上将 `/ui/parse` 冷启动耗时优化到可接受范围并记录对比（当前 3 样本：`80.99s / 16.28s / 16.17s`）；
+- 评估并最小化 `install_runtime.sh` 中兼容性 pin 对其他 Colab 包的副作用（M6-3 已完成，后续按清单周期复检）；
+- 自动化回归（`mock + native import smoke`）保持可执行并纳入日常变更验收。
+- T4 真机采集命令：`bash scripts/ops.sh measure-uiparse-coldstart --expect-engine-mode native --runs 3 --restart-cmd "bash scripts/ops.sh restart"`。
